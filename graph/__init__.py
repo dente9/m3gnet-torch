@@ -1,20 +1,20 @@
-# m3gnet/graph/__init__.py (Final Correct Version)
+# m3gnet/graph/__init__.py (Final Version with Updated Export)
 
 """
 This module contains classes and functions for graph representations of materials.
 """
 
-from .struct_to_graph import MaterialGraph, RadiusCutoffGraphConverter
+# Export the core classes and the type hint
+from .struct_to_graph import MaterialGraph, RadiusCutoffGraphConverter, StructureOrMolecule
 
-# We now export two separate collate functions for different trainer needs.
+# Export the specific collate functions
 from .batch import collate_list_of_graphs, collate_potential_graphs
-
-# MaterialGraphDataset is part of the training module, so it is NOT exported here.
 
 # Define what is exposed when a user does `from m3gnet.graph import *`
 __all__ = [
     "MaterialGraph", 
     "RadiusCutoffGraphConverter", 
+    "StructureOrMolecule",
     "collate_list_of_graphs",
     "collate_potential_graphs",
 ]

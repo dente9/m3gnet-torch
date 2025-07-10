@@ -1,30 +1,25 @@
-# m3gnet/__init__.py (Fixed Version)
+# m3gnet/__init__.py (Final Version with Updated Export)
 
 """
 The M3GNet project for deep learning potentials for molecules and crystals.
 This is a modern, PyTorch-native re-implementation.
 """
 
-# Define the package version
 __version__ = "1.0.0-refactored"
 
-# Expose key classes from submodules to the top-level namespace
-# This allows users to do `from m3gnet import M3GNet`
-from .graph import MaterialGraph, RadiusCutoffGraphConverter
+# Import from the new definitive locations
+from .graph import MaterialGraph, RadiusCutoffGraphConverter, StructureOrMolecule
 from .models import M3GNet, Potential, M3GNetCalculator, Relaxer
 from .train import PotentialTrainer, PropertyTrainer, ModelCheckpoint, EarlyStopping
-from .types import StructureOrMolecule
 
-# The collate function is removed from the top-level namespace as it's a
-# specific utility for data loading, not a primary API component.
-# Users who need it for custom DataLoaders can import it directly:
-# from m3gnet.graph.batch import collate_list_of_graphs
+# collate functions are considered implementation details of the trainer,
+# so we don't expose them at the top level.
 
-# Define what is exposed when a user does `from m3gnet import *`
 __all__ = [
     "__version__",
     "MaterialGraph",
     "RadiusCutoffGraphConverter",
+    "StructureOrMolecule",
     "M3GNet",
     "Potential",
     "M3GNetCalculator",
@@ -33,5 +28,4 @@ __all__ = [
     "PropertyTrainer",
     "ModelCheckpoint",
     "EarlyStopping",
-    "StructureOrMolecule"
 ]

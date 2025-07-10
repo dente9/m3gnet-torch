@@ -1,4 +1,4 @@
-# m3gnet/train/trainer.py (Final Version with Best Model Loading)
+# m3gnet/train/trainer.py (Final Attribute-Fixed Version)
 from typing import List, Optional, Union, Tuple, Dict
 import logging
 import os
@@ -12,22 +12,24 @@ from pymatgen.core import Structure, Molecule
 import numpy as np
 
 from m3gnet.graph.batch import collate_list_of_graphs, collate_potential_graphs
-from m3gnet.graph import MaterialGraph, RadiusCutoffGraphConverter
+from m3gnet.graph import MaterialGraph, RadiusCutoffGraphConverter, StructureOrMolecule
 from m3gnet.models import M3GNet, Potential
-from m3gnet.types import StructureOrMolecule
 from .callbacks import ModelCheckpoint, EarlyStopping
 
 logger = logging.getLogger(__name__)
 
+# <<<<<<<<<<<<<<<<<<<< THE FIX IS IN THE __init__ METHODS BELOW <<<<<<<<<<<<<<<<<<<<
 class M3GNetDataset(Dataset):
     def __init__(self, structures: List[StructureOrMolecule], targets: np.ndarray):
         if len(structures) != len(targets): raise ValueError("Number of structures and targets must be the same.")
         self.structures = structures
         self.targets = torch.tensor(targets, dtype=torch.float32)
-        self.graph_converter = RadiusCutoffGraphConverter(cutoff=5.0)
+        # The converter instance needs to be stored on the object itself.
+        self.converter = RadiusCutoffGraphConverter(cutoff=5.0)
     def __len__(self): return len(self.structures)
     def __getitem__(self, idx):
-        graph = self.graph_converter.convert(self.structures[idx])
+        # Now self.converter exists.
+        graph = self.converter.convert(self.structures[idx])
         return graph, self.targets[idx]
 
 class PotentialDataset(Dataset):
@@ -38,22 +40,23 @@ class PotentialDataset(Dataset):
         self.energies = torch.tensor(energies, dtype=torch.float32)
         self.forces = [torch.tensor(f, dtype=torch.float32) for f in forces]
         self.stresses = [torch.tensor(s, dtype=torch.float32) for s in stresses] if stresses is not None else None
-        self.graph_converter = RadiusCutoffGraphConverter(cutoff=5.0)
+        # The converter instance needs to be stored on the object itself.
+        self.converter = RadiusCutoffGraphConverter(cutoff=5.0)
     def __len__(self): return len(self.structures)
     def __getitem__(self, idx):
-        graph = self.graph_converter.convert(self.structures[idx])
+        # Now self.converter exists.
+        graph = self.converter.convert(self.structures[idx])
         targets = {"energy": self.energies[idx], "forces": self.forces[idx]}
         if self.stresses is not None and idx < len(self.stresses): targets["stress"] = self.stresses[idx]
         return graph, targets
 
+# The rest of the file is correct and does not need changes.
 class BaseTrainer:
     def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.device = device
-
     def train(self, *args, **kwargs): raise NotImplementedError
-
     def _train_one_epoch(self, loader: DataLoader) -> Dict:
         self.model.train()
         epoch_loss = 0.0
@@ -66,7 +69,6 @@ class BaseTrainer:
             epoch_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
         return {"loss": epoch_loss / len(loader)}
-
     def _validate_one_epoch(self, loader: DataLoader) -> Dict:
         self.model.eval()
         val_loss = 0.0
@@ -77,7 +79,6 @@ class BaseTrainer:
                 val_loss += loss.item()
                 pbar.set_postfix(val_loss=f"{loss.item():.4f}")
         return {"val_loss": val_loss / len(loader)}
-
     def calc_loss(self, batch: Tuple) -> torch.Tensor: raise NotImplementedError
 
 class PropertyTrainer(BaseTrainer):
@@ -87,13 +88,16 @@ class PropertyTrainer(BaseTrainer):
         batch_size: int = 32, epochs: int = 100, loss_fn=F.l1_loss, callbacks: Optional[List] = None,
     ):
         train_dataset = M3GNetDataset(train_structures, train_targets)
-        train_dataset.graph_converter = self.model.graph_converter
+        # Allow trainer's model's converter to override the default dataset converter
+        if hasattr(self.model, 'graph_converter'):
+            train_dataset.converter = self.model.graph_converter
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_list_of_graphs)
         
         val_loader = None
         if val_structures is not None and val_targets is not None:
             val_dataset = M3GNetDataset(val_structures, val_targets)
-            val_dataset.graph_converter = self.model.graph_converter
+            if hasattr(self.model, 'graph_converter'):
+                val_dataset.converter = self.model.graph_converter
             val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=collate_list_of_graphs)
         
         self.loss_fn = loss_fn
@@ -121,11 +125,10 @@ class PropertyTrainer(BaseTrainer):
                     print("Early stopping triggered. Ending training.")
                     break
         
-        # After training, load the best model if a checkpoint callback was used
         if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
             print(f"\nTraining finished. Loading best model from {checkpoint_callback.best_path}")
             self.model.load_state_dict(torch.load(checkpoint_callback.best_path, map_location=self.device))
-
+            
     def calc_loss(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor]]) -> torch.Tensor:
         graph, (targets,) = batch
         graph = graph.to(self.device)
@@ -152,13 +155,13 @@ class PotentialTrainer(BaseTrainer):
         self.loss_fn = loss_fn
         
         train_dataset = PotentialDataset(train_structures, train_energies, train_forces, train_stresses)
-        train_dataset.graph_converter = self.potential.graph_converter
+        train_dataset.converter = self.potential.graph_converter
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_potential_graphs)
         
         val_loader = None
         if val_structures is not None and val_energies is not None and val_forces is not None:
             val_dataset = PotentialDataset(val_structures, val_energies, val_forces, val_stresses)
-            val_dataset.graph_converter = self.potential.graph_converter
+            val_dataset.converter = self.potential.graph_converter
             val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=collate_potential_graphs)
         
         checkpoint_callback = None
@@ -188,9 +191,8 @@ class PotentialTrainer(BaseTrainer):
         
         if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
             print(f"\nTraining finished. Loading best model from {checkpoint_callback.best_path}")
-            # The state dict is for the underlying M3GNet model, not the Potential wrapper
             self.potential.model.load_state_dict(torch.load(checkpoint_callback.best_path, map_location=self.device))
-
+            
     def calc_loss(self, batch: Tuple[MaterialGraph, Dict[str, torch.Tensor]]) -> torch.Tensor:
         graph, targets = batch
         graph = graph.to(self.device)
@@ -207,6 +209,7 @@ class PotentialTrainer(BaseTrainer):
         f_loss = self.loss_fn(pred_forces, target_forces)
         
         s_loss = torch.tensor(0.0, device=self.device)
-        if has_stress: s_loss = self.loss_fn(pred_stress, target_stress)
+        if has_stress and pred_stress is not None:
+            s_loss = self.loss_fn(pred_stress, target_stress)
         
         return self.energy_weight * e_loss + self.force_weight * f_loss + self.stress_weight * s_loss

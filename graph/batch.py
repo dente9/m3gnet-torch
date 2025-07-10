@@ -1,4 +1,4 @@
-# m3gnet/graph/batch.py (Final Complete Version)
+# m3gnet/graph/batch.py (Final Version with Updated Import)
 """
 Tools for batching MaterialGraph objects for training.
 """
@@ -7,7 +7,8 @@ from typing import List, Tuple, Optional, Dict
 import torch
 import numpy as np
 
-from .struct_to_graph import MaterialGraph
+# Import StructureOrMolecule from its new, definitive location
+from .struct_to_graph import MaterialGraph, StructureOrMolecule
 
 def _batch_graphs(graphs: List[MaterialGraph]) -> MaterialGraph:
     """Helper function to batch graph attributes."""
@@ -51,32 +52,26 @@ def _batch_graphs(graphs: List[MaterialGraph]) -> MaterialGraph:
     return batched_graph
 
 def collate_list_of_graphs(batch: List[Tuple[MaterialGraph, torch.Tensor]]) -> Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]:
-    """For property prediction with a single scalar target."""
     graphs = [item[0] for item in batch]
     targets = [item[1] for item in batch]
-    
     batched_graph = _batch_graphs(graphs)
     batched_targets = (torch.stack(targets, dim=0).view(-1, 1),)
     return batched_graph, batched_targets
 
 def collate_potential_graphs(batch: List[Tuple[MaterialGraph, Dict[str, torch.Tensor]]]) -> Tuple[MaterialGraph, Dict[str, torch.Tensor]]:
-    """For potential training with a dictionary of targets (energy, forces, stress)."""
     graphs = [item[0] for item in batch]
     targets_list = [item[1] for item in batch]
-
     batched_graph = _batch_graphs(graphs)
-    
     batched_targets = {}
     keys = targets_list[0].keys()
     for key in keys:
         current_targets = [t.get(key) for t in targets_list]
         if all(t is None for t in current_targets):
             continue
-        
         if key == 'forces':
-            batched_targets[key] = torch.cat(current_targets, dim=0)
-        else: # energy, stress
-            stacked_targets = torch.stack(current_targets, dim=0)
+            batched_targets[key] = torch.cat([t for t in current_targets if t is not None], dim=0)
+        else:
+            stacked_targets = torch.stack([t for t in current_targets if t is not None], dim=0)
             if stacked_targets.ndim == 1:
                 batched_targets[key] = stacked_targets.view(-1, 1)
             else:

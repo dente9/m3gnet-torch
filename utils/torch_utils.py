@@ -3,7 +3,7 @@ import torch
 from torch_scatter import segment_sum_coo
 from typing import Tuple 
 
-# --- (其他函数保持不变) ---
+
 def get_segment_indices_from_n(n: torch.Tensor) -> torch.Tensor:
     """Creates segment IDs from a tensor of counts."""
     return torch.repeat_interleave(

@@ -1,4 +1,4 @@
-# m3gnet/layers/_basis.py (Final Fixed Version)
+# m3gnet/layers/_basis.py (Final Fixed Version 2)
 
 """Basis function expansions for distances and angles."""
 
@@ -8,6 +8,7 @@ import torch.nn as nn
 from typing import Optional
 import math
 
+# associated_legendre_polynomials, SphericalHarmonicsBasis, GaussianBasis, SphericalBesselBasis are unchanged...
 def associated_legendre_polynomials(costheta, max_l=3):
     """
     Computes associated Legendre polynomials P_l^m(cos(theta)).
@@ -97,6 +98,7 @@ class SphericalBesselBasis(nn.Module):
         n = self.j0_zeros / self.cutoff
         return torch.sqrt(torch.tensor(2.0 / self.cutoff)) * torch.sin(n * r) / r
 
+# <<<<<<<<<<<<<<<<<<<< FIX IS HERE <<<<<<<<<<<<<<<<<<<<
 class SphericalBesselWithHarmonics(nn.Module):
     """Combines Spherical Bessel and Spherical Harmonics."""
     def __init__(self, max_n: int, max_l: int, cutoff: float):
@@ -107,8 +109,11 @@ class SphericalBesselWithHarmonics(nn.Module):
         self.max_l = max_l
 
     def forward(self, r: torch.Tensor, costheta: torch.Tensor, phi: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Ensure costheta is always 1D before passing to shf
+        costheta_1d = costheta.squeeze(-1) if costheta.dim() == 2 else costheta
+        
         sbf = self.sbf(r)
-        shf = self.shf(costheta, phi)
+        shf = self.shf(costheta_1d, phi)
         
         n_sbf = sbf.shape[-1]
         n_shf = shf.shape[-1]

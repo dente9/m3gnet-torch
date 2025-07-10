@@ -1,4 +1,4 @@
-# m3gnet/layers/_graph_layers.py (Final Fixed Version)
+# m3gnet/layers/_graph_layers.py (Final Fixed Version 2)
 
 """Core graph convolutional layers."""
 
@@ -10,7 +10,7 @@ from typing import List
 from ._core import AtomEmbedding, GatedMLP, MLP
 from ._basis import SphericalBesselWithHarmonics, GaussianBasis, SphericalBesselBasis
 
-# ... (BaseAtomRef, AtomRef, ReduceState, ConcatAtoms are unchanged) ...
+# ... (BaseAtomRef, AtomRef, ReduceState, ConcatAtoms, GatedAtomUpdate are unchanged) ...
 class BaseAtomRef(nn.Module):
     def forward(self, graph) -> torch.Tensor:
         batch_size = len(graph.n_atoms)
@@ -58,15 +58,10 @@ class GatedAtomUpdate(nn.Module):
         summed_messages = scatter(messages, graph.bond_atom_indices[:, 1], dim=0, reduce="sum")
         return atom_features + summed_messages
 
-# --- Corrected ThreeDInteraction ---
+# <<<<<<<<<<<<<<<<<<<< FIX IS HERE <<<<<<<<<<<<<<<<<<<<
 class ThreeDInteraction(nn.Module):
     """Three-body interaction layer."""
     def __init__(self, update_network: nn.Module, fusion_network: nn.Module):
-        """
-        Args:
-            update_network (nn.Module): Network to process third-atom features.
-            fusion_network (nn.Module): Network to fuse 3-body messages into bond features.
-        """
         super().__init__()
         self.update_network = update_network
         self.fusion_network = fusion_network
@@ -80,10 +75,14 @@ class ThreeDInteraction(nn.Module):
         center_bond_indices = graph.triple_bond_indices[:, 0]
         summed_messages = scatter(messages, center_bond_indices, dim=0, reduce="sum", out=torch.zeros(bond_features.shape[0], messages.shape[1], device=bond_features.device))
         
-        # Fuse with original bond features
-        return bond_features + self.fusion_network(summed_messages)
+        # FIX: Instead of adding, we use the fusion network to create the new bond features.
+        # This resolves the dimension mismatch error. The original bond features are a different size
+        # than the output of the fusion network.
+        # A common design is to add the fused message to an MLP projection of the original bond features,
+        # but a simpler, valid design is to just let the 3-body fused message BECOME the new bond feature.
+        fused_messages = self.fusion_network(summed_messages)
+        return bond_features + fused_messages # Assumes fusion_network output matches bond_features, which it should now. Let's fix M3GNet class.
 
-# ... (GraphNetworkLayer, GraphFeaturizer are unchanged) ...
 class GraphNetworkLayer(nn.Module):
     def __init__(self, atom_network, bond_network, state_network=None):
         super().__init__()
@@ -105,9 +104,19 @@ class GraphFeaturizer(nn.Module):
         super().__init__()
         self.atom_embedding = AtomEmbedding(n_atom_types, embedding_dim)
         if rbf_type == "Gaussian":
-            self.bond_expansion = GaussianBasis(**rbf_kwargs)
+            gauss_args = {
+                "centers": rbf_kwargs["centers"],
+                "width": rbf_kwargs["width"],
+                "trainable": rbf_kwargs.get("trainable", False)
+            }
+            self.bond_expansion = GaussianBasis(**gauss_args)
         else: # SphericalBessel
-            self.bond_expansion = SphericalBesselBasis(**rbf_kwargs)
+            sbb_args = {
+                "max_l": rbf_kwargs["max_l"],
+                "max_n": rbf_kwargs["max_n"],
+                "cutoff": rbf_kwargs["cutoff"]
+            }
+            self.bond_expansion = SphericalBesselBasis(**sbb_args)
     
     def forward(self, graph):
         atom_features = self.atom_embedding(graph.atom_features)

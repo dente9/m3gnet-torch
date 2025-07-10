@@ -1,1 +1,17 @@
 data/
+# 忽略所有 __pycache__ 文件夹
+**/__pycache__/
+
+# 忽略所有 Python 编译文件
+*.py[cod]
+
+# 忽略所有 PYD 扩展模块
+*.pyd
+
+# 忽略所有 Python 优化文件
+*.pyo
+
+# 忽略所有 Python 缓存文件
+*.pyd
+
+*.pyc

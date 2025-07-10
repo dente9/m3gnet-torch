@@ -1,9 +1,8 @@
-# m3gnet/graph/batch.py (Corrected Version)
+# m3gnet/graph/batch.py (Final-Final Version)
 """
 Tools for batching MaterialGraph objects for training.
-This includes a PyTorch Dataset and a custom collate function.
 """
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional
 
 import torch
 import numpy as np
@@ -11,98 +10,66 @@ from torch.utils.data import Dataset
 
 from .struct_to_graph import MaterialGraph, RadiusCutoffGraphConverter, StructureOrMolecule
 
-def collate_fn(batch: List[Tuple[MaterialGraph, ...]]) -> Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]:
-    """
-    Custom collate function to batch multiple MaterialGraph objects into a single large graph.
-    This function is designed to be used with a PyTorch DataLoader.
+def collate_list_of_graphs(batch: List[Tuple[MaterialGraph, ...]]) -> Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]:
+    if not batch:
+        return None, None
 
-    Args:
-        batch (List[Tuple[MaterialGraph, ...]]): A list where each element is a tuple.
-            The first item of the tuple is a MaterialGraph object, and the rest are
-            tensors (e.g., energy, forces, stress).
-
-    Returns:
-        Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]: A tuple containing:
-            - A single batched MaterialGraph.
-            - A tuple of batched target tensors.
-    """
-    graphs, targets_by_type = list(zip(*[(b[0], b[1:]) for b in batch]))
-
-    # Keep track of cumulative number of atoms and bonds
-    n_atom_cumsum = torch.cumsum(torch.cat([g.n_atoms for g in graphs]), dim=0)
-    n_bond_cumsum = torch.cumsum(torch.cat([g.n_bonds for g in graphs]), dim=0)
-    
-    # Prepend zero for easier indexing
-    n_atom_cumsum_shifted = torch.cat([torch.tensor([0]), n_atom_cumsum[:-1]])
-    n_bond_cumsum_shifted = torch.cat([torch.tensor([0]), n_bond_cumsum[:-1]])
+    graphs = [item[0] for item in batch]
+    targets_list = [item[1:] for item in batch]
 
     # Batch graph attributes
-    batched_attrs = {
-        "atom_features": torch.cat([g.atom_features for g in graphs], dim=0),
-        "bond_features": torch.cat([g.bond_features for g in graphs], dim=0),
-        "atom_positions": torch.cat([g.atom_positions for g in graphs], dim=0),
-        "pbc_offsets": torch.cat([g.pbc_offsets for g in graphs], dim=0),
-        "n_atoms": torch.cat([g.n_atoms for g in graphs]),
-        "n_bonds": torch.cat([g.n_bonds for g in graphs]),
-        "lattices": torch.cat([g.lattices for g in graphs if g.lattices is not None], dim=0) if any(g.lattices is not None for g in graphs) else None,
-        "state_features": torch.cat([g.state_features for g in graphs if g.state_features is not None], dim=0) if any(g.state_features is not None for g in graphs) else None,
-    }
+    atom_features = torch.cat([g.atom_features for g in graphs], dim=0)
+    bond_features = torch.cat([g.bond_features for g in graphs], dim=0)
+    atom_positions = torch.cat([g.atom_positions for g in graphs], dim=0)
+    pbc_offsets = torch.cat([g.pbc_offsets for g in graphs], dim=0)
+    
+    atom_offsets = torch.cumsum(torch.tensor([0] + [g.n_atoms.item() for g in graphs[:-1]]), dim=0)
+    bond_atom_indices = torch.cat([g.bond_atom_indices + offset for g, offset in zip(graphs, atom_offsets)], dim=0)
+    
+    batched_graph = MaterialGraph(
+        atom_features=atom_features, bond_features=bond_features,
+        atom_positions=atom_positions, bond_atom_indices=bond_atom_indices,
+        pbc_offsets=pbc_offsets, n_atoms=torch.tensor([g.n_atoms.item() for g in graphs]),
+        n_bonds=torch.tensor([g.n_bonds.item() for g in graphs]),
+        lattices=torch.cat([g.lattices for g in graphs if g.lattices is not None]) if any(g.lattices is not None for g in graphs) else None,
+        state_features=torch.cat([g.state_features for g in graphs if g.state_features is not None]) if any(g.state_features is not None for g in graphs) else None,
+        has_three_body=any(g.has_three_body for g in graphs)
+    )
 
-    # Adjust indices for the batched graph
-    bond_atom_indices = []
-    for i, g in enumerate(graphs):
-        bond_atom_indices.append(g.bond_atom_indices + n_atom_cumsum_shifted[i])
-    batched_attrs["bond_atom_indices"] = torch.cat(bond_atom_indices, dim=0)
-
-    # Handle three-body information
-    graphs_with_3body = [g for g in graphs if g.has_three_body and g.triple_bond_indices is not None]
-    if graphs_with_3body:
-        batched_attrs["has_three_body"] = True
-        batched_attrs["triple_features"] = torch.cat([g.triple_features for g in graphs_with_3body], dim=0)
-        batched_attrs["n_triples"] = torch.cat([g.n_triples for g in graphs_with_3body])
-        
-        triple_bond_indices = []
-        graph_indices_with_3body = [i for i, g in enumerate(graphs) if g.has_three_body and g.triple_bond_indices is not None]
-        for i, g in zip(graph_indices_with_3body, graphs_with_3body):
-            triple_bond_indices.append(g.triple_bond_indices + n_bond_cumsum_shifted[i])
-        batched_attrs["triple_bond_indices"] = torch.cat(triple_bond_indices, dim=0)
-    else:
-        batched_attrs["has_three_body"] = False
-
-    batched_graph = MaterialGraph(**batched_attrs)
-
-    # --- START OF CORRECTED LOGIC FOR TARGETS ---
+    if batched_graph.has_three_body:
+        bond_offsets = torch.cumsum(torch.tensor([0] + [g.n_bonds.item() for g in graphs[:-1]]), dim=0)
+        triple_bond_indices = [g.triple_bond_indices + offset for g, offset in zip(graphs, bond_offsets) if g.triple_bond_indices is not None]
+        batched_graph.triple_bond_indices = torch.cat(triple_bond_indices) if triple_bond_indices else None
+        triple_features = [g.triple_features for g in graphs if g.triple_features is not None]
+        batched_graph.triple_features = torch.cat(triple_features) if triple_features else None
+        triple_bond_lengths = [g.triple_bond_lengths for g in graphs if g.triple_bond_lengths is not None]
+        batched_graph.triple_bond_lengths = torch.cat(triple_bond_lengths) if triple_bond_lengths else None
+        n_triples = [g.n_triples.item() for g in graphs if g.n_triples is not None]
+        batched_graph.n_triples = torch.tensor(n_triples) if n_triples else torch.tensor([0])
+    
+    # Batch targets
     batched_targets = []
-    if targets_by_type:
-        num_targets = len(targets_by_type[0])
-        for i in range(num_targets):
-            target_tensors = [t[i] for t in targets_by_type if t[i] is not None]
-            if not target_tensors:
+    if targets_list and targets_list[0]:
+        num_targets_per_graph = len(targets_list[0])
+        for i in range(num_targets_per_graph):
+            current_targets = [t[i] for t in targets_list]
+            if all(t is None for t in current_targets):
                 batched_targets.append(None)
                 continue
             
-            # Heuristic to decide whether to stack or concatenate:
-            # If the target's first dimension size matches the number of atoms in the graph,
-            # it's a per-atom property (like forces) and should be concatenated.
-            # Otherwise, it's a per-graph property (like energy or stress) and should be stacked.
-            is_per_atom_property = (
-                target_tensors[0].ndim > 0 and 
-                target_tensors[0].shape[0] == graphs[0].n_atoms.item()
-            )
-
-            if is_per_atom_property:
-                batched_targets.append(torch.cat(target_tensors, dim=0))
+            # Check if it's a per-atom property (like forces) vs per-graph (like energy)
+            if current_targets[0].ndim > 0 and current_targets[0].shape[0] == graphs[0].n_atoms.item():
+                batched_targets.append(torch.cat(current_targets, dim=0))
             else:
-                batched_targets.append(torch.stack(target_tensors, dim=0))
-    # --- END OF CORRECTED LOGIC FOR TARGETS ---
-                
+                # <<<<<<<<<<<<<<<<<<<< THE FIX IS HERE <<<<<<<<<<<<<<<<<<<<
+                # Ensure per-graph properties are always [batch_size, 1] for consistency
+                stacked_targets = torch.stack(current_targets, dim=0)
+                batched_targets.append(stacked_targets.view(-1, 1))
+    
     return batched_graph, tuple(batched_targets)
 
 
 class MaterialGraphDataset(Dataset):
-    """
-    A PyTorch Dataset for a list of structures and their associated properties.
-    """
     def __init__(
         self,
         structures: List[StructureOrMolecule],

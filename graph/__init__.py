@@ -1,25 +1,12 @@
-# m3gnet/graph/__init__.py
+# m3gnet/graph/__init__.py (Final Fixed Version)
 
 """
-m3gnet.graph
-============
-
-This package contains tools for converting atomic structures to graph representations
-and batching them for use in PyTorch models.
-
-The key components are:
-- MaterialGraph: A dataclass for holding graph data.
-- RadiusCutoffGraphConverter: A utility to convert pymatgen/ASE structures to MaterialGraph objects.
-- MaterialGraphDataset: A PyTorch Dataset for handling collections of structures.
-- collate_fn: A function to batch multiple MaterialGraph objects into a single large graph.
+This module contains classes and functions for graph representations of materials.
 """
 
 from .struct_to_graph import MaterialGraph, RadiusCutoffGraphConverter
-from .batch import MaterialGraphDataset, collate_fn
+# Now we can safely import and expose the correctly named function
+from .batch import collate_list_of_graphs, MaterialGraphDataset
 
-__all__ = [
-    "MaterialGraph",
-    "RadiusCutoffGraphConverter",
-    "MaterialGraphDataset",
-    "collate_fn",
-]
+# Define what is exposed when a user does `from m3gnet.graph import *`
+__all__ = ["MaterialGraph", "RadiusCutoffGraphConverter", "collate_list_of_graphs", "MaterialGraphDataset"]

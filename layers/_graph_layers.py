@@ -1,16 +1,15 @@
-# m3gnet/layers/_graph_layers.py (Final Scatter-Fixed Version)
+# m3gnet/layers/_graph_layers.py (Final Version with Selectable Embedding)
 
 """Core graph convolutional layers."""
-
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
 from typing import List
 
-from ._core import AtomEmbedding, GatedMLP, MLP
+# Import our new embedding layer
+from ._core import AtomEmbedding, GatedMLP, MLP, AttentionAtomEmbedding
 from ._basis import SphericalBesselWithHarmonics, GaussianBasis, SphericalBesselBasis
 
-# ... (BaseAtomRef, AtomRef, ReduceState, ConcatAtoms are unchanged) ...
 class BaseAtomRef(nn.Module):
     def forward(self, graph) -> torch.Tensor:
         batch_size = len(graph.n_atoms)
@@ -45,29 +44,19 @@ class ConcatAtoms(nn.Module):
         concatenated = torch.cat([sender_atoms, receiver_atoms, bond_features], dim=-1)
         return self.mlp(concatenated)
 
-# <<<<<<<<<<<<<<<<<<<< THE FIX IS HERE <<<<<<<<<<<<<<<<<<<<
 class GatedAtomUpdate(nn.Module):
     def __init__(self, neurons: List[int]):
         super().__init__()
         self.mlp = GatedMLP(neurons)
-    
     def forward(self, atom_features, bond_features, graph) -> torch.Tensor:
         messages = self.mlp(bond_features)
-        
-        # Explicitly provide the output size to `scatter` to avoid shape mismatches.
-        # The output size should be the total number of atoms in the batch.
         total_num_atoms = atom_features.size(0)
-        
         summed_messages = scatter(
-            messages, 
-            graph.bond_atom_indices[:, 1], 
-            dim=0, 
-            dim_size=total_num_atoms, 
-            reduce="sum"
+            messages, graph.bond_atom_indices[:, 1], dim=0, 
+            dim_size=total_num_atoms, reduce="sum"
         )
         return atom_features + summed_messages
 
-# ... (ThreeDInteraction and other classes are unchanged) ...
 class ThreeDInteraction(nn.Module):
     def __init__(self, update_network: nn.Module, fusion_network: nn.Module):
         super().__init__()
@@ -101,16 +90,43 @@ class GraphNetworkLayer(nn.Module):
         return atom_features, bond_features, state_features
 
 class GraphFeaturizer(nn.Module):
-    def __init__(self, n_atom_types, embedding_dim, rbf_type="Gaussian", **rbf_kwargs):
+    """
+    Handles the initial featurization of the graph, converting atomic numbers
+    and bond lengths into feature vectors.
+    """
+    def __init__(
+        self, 
+        n_atom_types: int, 
+        embedding_dim: int, 
+        rbf_type: str = "SphericalBessel", 
+        embedding_type: str = "attention", # New parameter to choose embedding type
+        **rbf_kwargs
+    ):
         super().__init__()
-        self.atom_embedding = AtomEmbedding(n_atom_types, embedding_dim)
+        
+        self.embedding_type = embedding_type.lower()
+        if self.embedding_type == "attention":
+            self.atom_embedding = AttentionAtomEmbedding(n_atom_types, embedding_dim)
+            print("Using Context-Aware Attention Atom Embedding.")
+        else: # Default to standard embedding
+            self.atom_embedding = AtomEmbedding(n_atom_types, embedding_dim)
+            print("Using Standard Atom Embedding.")
+
         if rbf_type == "Gaussian":
             gauss_args = {"centers": rbf_kwargs["centers"], "width": rbf_kwargs["width"], "trainable": rbf_kwargs.get("trainable", False)}
             self.bond_expansion = GaussianBasis(**gauss_args)
-        else: # SphericalBessel
+        else:
             sbb_args = {"max_l": rbf_kwargs["max_l"], "max_n": rbf_kwargs["max_n"], "cutoff": rbf_kwargs["cutoff"]}
             self.bond_expansion = SphericalBesselBasis(**sbb_args)
+    
     def forward(self, graph):
-        atom_features = self.atom_embedding(graph.atom_features)
+        if self.embedding_type == "attention":
+            # The AttentionAtomEmbedding's forward pass expects the whole graph.
+            atom_features = self.atom_embedding(graph)
+        else: 
+            # The standard AtomEmbedding just needs the atom numbers.
+            atom_features = self.atom_embedding(graph.atom_features)
+            
         bond_features = self.bond_expansion(graph.bond_features)
+        
         return atom_features, bond_features, graph.state_features

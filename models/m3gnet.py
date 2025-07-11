@@ -23,7 +23,7 @@ MODEL_NAME = "m3gnet"
 class M3GNet(nn.Module):
     def __init__(
         self, max_n: int = 3, max_l: int = 3, n_blocks: int = 3, units: int = 64,
-        cutoff: float = 5.0, threebody_cutoff: float = 4.0, n_atom_types: int = 95, 
+        cutoff: float = 4.0, threebody_cutoff: float = 2.5, n_atom_types: int = 95, 
         is_intensive: bool = True, readout: str = "weighted_atom", 
         task_type: str = "regression", embedding_type: str = "attention",
         mean: float = 0.0, std: float = 1.0, element_refs: Optional[np.ndarray] = None, **kwargs

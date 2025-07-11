@@ -24,8 +24,8 @@ SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "property_predictor")
 
 EMBEDDING_TYPE = "attention" 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCHS = 3
-BATCH_SIZE = 64
+EPOCHS = 50
+BATCH_SIZE = 128
 LEARNING_RATE = 1e-4
 USE_EARLY_STOPPING = True
 PATIENCE = 15
@@ -39,10 +39,10 @@ def main():
     if platform.system().lower() != 'windows':
         try:
             num_cores = len(os.sched_getaffinity(0))
-            NUM_WORKERS = num_cores // 2
+            NUM_WORKERS = 12
         except AttributeError:
             num_cores = os.cpu_count()
-            NUM_WORKERS = num_cores // 2 if num_cores else 0
+            NUM_WORKERS = 12 if num_cores else 0
     
     config = {
         "Device": DEVICE, "Embedding Type": EMBEDDING_TYPE, "Epochs": EPOCHS, "Batch Size": BATCH_SIZE,

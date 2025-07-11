@@ -1,4 +1,4 @@
-# m3gnet/train/trainer.py (Performance Optimized Version)
+# m3gnet/train/trainer.py (Final Version)
 from typing import List, Optional, Union, Tuple, Dict
 import logging
 import os
@@ -18,12 +18,7 @@ from .callbacks import ModelCheckpoint, EarlyStopping
 
 logger = logging.getLogger(__name__)
 
-# <<<<<<<<<<<<<<<<<<<< DATASET OPTIMIZATION <<<<<<<<<<<<<<<<<<<<
-# The new Dataset classes will accept pre-computed graphs, not structures.
-# This is crucial for efficient multi-process data loading (num_workers > 0).
-
 class M3GNetDataset(Dataset):
-    """A PyTorch Dataset for pre-computed MaterialGraphs and their targets."""
     def __init__(self, graphs: List[MaterialGraph], targets: np.ndarray):
         if len(graphs) != len(targets): raise ValueError("Number of graphs and targets must be the same.")
         self.graphs = graphs
@@ -33,10 +28,9 @@ class M3GNetDataset(Dataset):
         return self.graphs[idx], self.targets[idx]
 
 class PotentialDataset(Dataset):
-    """A PyTorch Dataset for pre-computed MaterialGraphs and potential targets."""
     def __init__(self, graphs: List[MaterialGraph], energies: np.ndarray, forces: List[np.ndarray], stresses: Optional[List[np.ndarray]] = None):
-        if not (len(graphs) == len(energies) == len(forces)): raise ValueError("Mismatch in the number of graphs, energies, and forces.")
-        if stresses is not None and len(graphs) != len(stresses): raise ValueError("Mismatch in the number of graphs and stresses.")
+        if not (len(graphs) == len(energies) == len(forces)): raise ValueError("Mismatch in numbers of graphs, energies, and forces.")
+        if stresses is not None and len(graphs) != len(stresses): raise ValueError("Mismatch in numbers of graphs and stresses.")
         self.graphs = graphs
         self.energies = torch.tensor(energies, dtype=torch.float32)
         self.forces = [torch.tensor(f, dtype=torch.float32) for f in forces]
@@ -47,9 +41,7 @@ class PotentialDataset(Dataset):
         if self.stresses is not None and idx < len(self.stresses): targets["stress"] = self.stresses[idx]
         return self.graphs[idx], targets
 
-# BaseTrainer is mostly unchanged, but we add num_workers and pin_memory to the method signatures.
 class BaseTrainer:
-    # ... __init__, _train_one_epoch, _validate_one_epoch, calc_loss are unchanged ...
     def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -64,7 +56,6 @@ class BaseTrainer:
             loss = self.calc_loss(batch)
             loss.backward()
             self.optimizer.step()
-            # If a scheduler is present, take a step
             if hasattr(self, 'scheduler') and self.scheduler is not None:
                 self.scheduler.step()
             epoch_loss += loss.item()
@@ -81,7 +72,6 @@ class BaseTrainer:
                 pbar.set_postfix(val_loss=f"{loss.item():.4f}")
         return {"val_loss": val_loss / len(loader)}
     def calc_loss(self, batch: Tuple) -> torch.Tensor: raise NotImplementedError
-
 
 class PropertyTrainer(BaseTrainer):
     def train(
@@ -104,8 +94,6 @@ class PropertyTrainer(BaseTrainer):
                 val_dataset, batch_size=batch_size, 
                 collate_fn=collate_list_of_graphs, num_workers=num_workers, pin_memory=pin_memory
             )
-        
-        # ... (rest of the training loop is unchanged) ...
         self.loss_fn = loss_fn
         checkpoint_callback = None
         if callbacks:
@@ -126,9 +114,13 @@ class PropertyTrainer(BaseTrainer):
                 if any(getattr(cb, 'stop_training', False) for cb in callbacks):
                     print("Early stopping triggered. Ending training.")
                     break
+        
+        # <<<<<<<<<<<<<<<<<<<< THE FIX IS HERE <<<<<<<<<<<<<<<<<<<<
+        # After training, load the best model weights from the correct file path
         if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
-            print(f"\nTraining finished. Loading best model from {checkpoint_callback.best_path}")
-            self.model.load_state_dict(torch.load(checkpoint_callback.best_path, map_location=self.device))
+            best_model_weights_path = os.path.join(checkpoint_callback.best_path, "m3gnet.pt")
+            print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
+            self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
             
     def calc_loss(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor]]) -> torch.Tensor:
         graph, (targets,) = batch
@@ -171,20 +163,23 @@ class PotentialTrainer(BaseTrainer):
                 collate_fn=collate_potential_graphs, num_workers=num_workers, pin_memory=pin_memory
             )
         
-        # ... (rest of the training loop is unchanged) ...
         checkpoint_callback = None
         if callbacks:
             for cb in callbacks:
                 if isinstance(cb, ModelCheckpoint):
                     checkpoint_callback = cb
+                    
         for epoch in range(epochs):
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
             train_logs = self._train_one_epoch(train_loader)
             logs = {**train_logs}
+            
             if val_loader:
                 val_logs = self._validate_one_epoch(val_loader)
                 logs.update(val_logs)
+            
             print(f"Epoch {epoch + 1} Summary: ", " | ".join([f"{k}: {v:.4f}" for k, v in logs.items()]))
+            
             if callbacks:
                 model_to_save = self.potential.model
                 for cb in callbacks:
@@ -192,9 +187,11 @@ class PotentialTrainer(BaseTrainer):
                 if any(getattr(cb, 'stop_training', False) for cb in callbacks):
                     print("Early stopping triggered. Ending training.")
                     break
+        
         if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
-            print(f"\nTraining finished. Loading best model from {checkpoint_callback.best_path}")
-            self.potential.model.load_state_dict(torch.load(checkpoint_callback.best_path, map_location=self.device))
+            best_model_weights_path = os.path.join(checkpoint_callback.best_path, "m3gnet.pt")
+            print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
+            self.potential.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
             
     def calc_loss(self, batch: Tuple[MaterialGraph, Dict[str, torch.Tensor]]) -> torch.Tensor:
         graph, targets = batch
@@ -203,10 +200,16 @@ class PotentialTrainer(BaseTrainer):
         target_forces = targets["forces"].to(self.device)
         has_stress = "stress" in targets and targets["stress"] is not None
         target_stress = targets["stress"].to(self.device) if has_stress else None
+        
         pred_energy, pred_forces, pred_stress = self.potential(graph, compute_forces=True, compute_stress=has_stress)
+        
         n_atoms_per_graph = graph.n_atoms.to(self.device).view(-1, 1)
         e_loss = self.loss_fn(pred_energy / n_atoms_per_graph, target_energy / n_atoms_per_graph)
+        
         f_loss = self.loss_fn(pred_forces, target_forces)
+        
         s_loss = torch.tensor(0.0, device=self.device)
-        if has_stress: s_loss = self.loss_fn(pred_stress, target_stress)
+        if has_stress and pred_stress is not None:
+            s_loss = self.loss_fn(pred_stress, target_stress)
+        
         return self.energy_weight * e_loss + self.force_weight * f_loss + self.stress_weight * s_loss

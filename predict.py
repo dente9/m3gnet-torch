@@ -1,4 +1,4 @@
-# m3gnet/predict.py (The Final, Ultimate, Streamlined Version)
+# m3gnet/predict.py (The Final, Ultimate, Correct Version)
 
 import sys
 import os
@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error
 from pymatgen.core import Structure
 from torch.utils.data import DataLoader, Dataset
-from typing import List, Union
+from typing import List, Optional
 
 # --- [ SCRIPT SETUP ] ---
 # Allows the script to find the m3gnet package
@@ -41,33 +41,15 @@ def _calculate_mape(y_true, y_pred):
     return np.mean(np.abs((y_true[non_zero_mask] - y_pred[non_zero_mask]) / y_true[non_zero_mask])) * 100
 
 # --- [ CORE REUSABLE FUNCTIONS ] ---
-
 def predict_from_structures(
-    model: M3GNet, 
-    structures: List[StructureOrMolecule], 
-    device: str = 'cpu', 
-    batch_size: int = 32
+    model: M3GNet, structures: List[StructureOrMolecule], 
+    device: str = 'cpu', batch_size: int = 32
 ) -> np.ndarray:
-    """
-    Performs predictions on a list of structure objects.
-    This is the core, reusable prediction logic for external scripts.
-
-    Args:
-        model (M3GNet): A trained M3GNet model.
-        structures (List[StructureOrMolecule]): A list of Pymatgen/ASE structures.
-        device (str): The device to run the model on ('cpu' or 'cuda').
-        batch_size (int): Batch size for prediction.
-
-    Returns:
-        np.ndarray: A numpy array of predictions.
-    """
+    """Core prediction logic on a list of structure objects."""
     model.to(device)
     model.eval()
-    
-    converter = model.graph_converter
-    dataset = _PredictionDataset(structures, converter)
+    dataset = _PredictionDataset(structures, model.graph_converter)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_list_of_graphs)
-    
     all_preds = []
     print("Performing predictions...")
     with torch.no_grad():
@@ -76,35 +58,16 @@ def predict_from_structures(
             graph = graph.to(device)
             preds = model(graph)
             all_preds.append(preds.cpu().numpy())
-            
     return np.concatenate(all_preds).flatten()
 
-
 def predict_from_files(
-    model_path: str,
-    input_path: str,
-    batch_size: int = 32,
-    device: str = 'cpu'
+    model_dir: str, input_path: str,
+    batch_size: int = 32, device: str = 'cpu'
 ) -> pd.DataFrame:
-    """
-    Loads a model and performs predictions on a file or directory.
-    This is a convenient wrapper for file-based operations.
-
-    Args:
-        model_path (str): Path to the trained model file (.pt).
-        input_path (str): Path to a single structure file or a directory of structure files.
-        batch_size (int): Batch size for prediction.
-        device (str): The device to run on.
-
-    Returns:
-        pd.DataFrame: A DataFrame with 'filename' and 'predicted_value' columns.
-    """
-    # 1. Load Model
-    print(f"Loading model from {model_path}...")
-    model = M3GNet(is_intensive=True, n_atom_types=95)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    """Loads a model and performs predictions on a file or directory."""
+    print(f"Loading model from directory: {model_dir}")
+    model = M3GNet.load(model_dir)
     
-    # 2. Load Structures
     input_p = Path(input_path)
     if input_p.is_dir():
         filepaths = sorted(glob.glob(os.path.join(input_p, "*.cif")))
@@ -118,45 +81,55 @@ def predict_from_files(
     filenames = [os.path.basename(f) for f in filepaths]
     print(f"Loaded {len(structures)} structures.")
 
-    # 3. Get Predictions using the core function
     predictions = predict_from_structures(model, structures, device, batch_size)
-    
-    # 4. Format and return results
     return pd.DataFrame({'filename': filenames, 'predicted_value': predictions})
 
-
+# --- [ MAIN COMMAND-LINE LOGIC ] ---
 def main():
     """Main command-line interface logic."""
     parser = argparse.ArgumentParser(
         description="Perform predictions or evaluations using a trained M3GNet model.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("model_path", type=str, help="Path to the trained model file (.pt).")
+    # The two required positional arguments
+    parser.add_argument("model_dir", type=str, help="Path to the directory containing the saved model (e.g., saved_models/property_predictor/best_model).")
     parser.add_argument("input_path", type=str, help="Path to a single CIF file or a directory of CIF files.")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for processing.")
     
+    # Optional arguments
+    parser.add_argument("--targets-csv", type=str, default=None, help="Path to a CSV file with true values for evaluation. If not provided, will automatically look for 'id_prop.csv' in the input directory.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory to save output files. Defaults to a new 'evaluation' sub-folder in the model directory.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for processing.")
+    parser.add_argument("--no-plot", action="store_true", help="Suppress the generation of the parity plot in evaluation mode.")
+
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # --- Smart Mode Detection ---
     input_dir = args.input_path if os.path.isdir(args.input_path) else os.path.dirname(args.input_path)
-    targets_csv_path = os.path.join(input_dir, "id_prop.csv")
+    # Use user-provided CSV if available, otherwise check for the default name
+    targets_csv_path = args.targets_csv if args.targets_csv else os.path.join(input_dir, "id_prop.csv")
     is_evaluation_mode = os.path.exists(targets_csv_path)
 
     # --- Output Directory Setup ---
-    output_dir = os.path.join(os.path.dirname(args.model_path), "evaluation")
+    output_dir = args.output_dir if args.output_dir else os.path.join(args.model_dir, "evaluation_results")
     os.makedirs(output_dir, exist_ok=True)
 
     # --- Run Prediction ---
-    results_df = predict_from_files(args.model_path, args.input_path, args.batch_size, device)
+    # This step is common to both modes
+    results_df = predict_from_files(args.model_dir, args.input_path, args.batch_size, device)
 
+    # --- Branch based on mode ---
     if is_evaluation_mode:
         print("\n--- [EVALUATION MODE] ---")
         print(f"'id_prop.csv' found. Comparing predictions against true values.")
         
-        # Merge true values
         targets_df = pd.read_csv(targets_csv_path)
-        results_df = pd.merge(results_df, targets_df, on="filename", suffixes=('_pred', '_true'))
+        results_df = pd.merge(results_df, targets_df, on="filename")
+        
+        # Check if 'property' column exists after merge
+        if 'property' not in results_df.columns:
+            raise ValueError(f"The CSV file at {targets_csv_path} must contain 'filename' and 'property' columns.")
+            
         results_df.rename(columns={'property': 'true_value'}, inplace=True)
         results_df['absolute_error'] = np.abs(results_df['true_value'] - results_df['predicted_value'])
         results_df = results_df[['filename', 'true_value', 'predicted_value', 'absolute_error']]
@@ -175,25 +148,24 @@ def main():
         print(f"Detailed evaluation results saved to {csv_path}")
 
         # Plotting
-        print("Generating parity plot...")
-        fig, ax = plt.subplots()
-        ax.scatter(results_df['true_value'], results_df['predicted_value'], alpha=0.5, label=f"MAE = {mae:.4f}")
-        lims = [np.min(results_df[['true_value', 'predicted_value']].values), np.max(results_df[['true_value', 'predicted_value']].values)]
-        ax.plot(lims, lims, 'k--', alpha=0.75, zorder=0, label="Perfect Match")
-        ax.set_aspect('equal'), ax.set_xlim(lims), ax.set_ylim(lims)
-        ax.set_title("Model Evaluation: Parity Plot"), ax.set_xlabel("True Values")
-        ax.set_ylabel("Predicted Values"), ax.legend(), ax.grid(True)
-        plot_path = os.path.join(output_dir, "evaluation_plot.png")
-        plt.savefig(plot_path, dpi=300)
-        print(f"Plot saved to {plot_path}")
-
+        if not args.no_plot:
+            print("Generating parity plot...")
+            fig, ax = plt.subplots()
+            ax.scatter(results_df['true_value'], results_df['predicted_value'], alpha=0.5, label=f"MAE = {mae:.4f}")
+            lims = [np.min(results_df[['true_value', 'predicted_value']].values), np.max(results_df[['true_value', 'predicted_value']].values)]
+            ax.plot(lims, lims, 'k--', alpha=0.75, zorder=0, label="Perfect Match")
+            ax.set_aspect('equal'), ax.set_xlim(lims), ax.set_ylim(lims)
+            ax.set_title("Model Evaluation: Parity Plot"), ax.set_xlabel("True Values")
+            ax.set_ylabel("Predicted Values"), ax.legend(), ax.grid(True)
+            plot_path = os.path.join(output_dir, "evaluation_plot.png")
+            plt.savefig(plot_path, dpi=300)
+            print(f"Plot saved to {plot_path}")
     else:
         print("\n--- [PREDICTION MODE] ---")
         print("'id_prop.csv' not found. Saving predictions only.")
         csv_path = os.path.join(output_dir, "prediction_results.csv")
         results_df.to_csv(csv_path, index=False, float_format='%.4f')
         print(f"Prediction results saved to {csv_path}")
-
 
 if __name__ == "__main__":
     main()

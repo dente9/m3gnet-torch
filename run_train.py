@@ -1,4 +1,4 @@
-# m3gnet/run_train.py (Final Version with Embedding Type Configuration)
+# m3gnet/run_train.py (Final Version)
 
 import sys
 import os
@@ -10,38 +10,25 @@ from pymatgen.core import Structure, Lattice, Molecule
 from tqdm import tqdm
 import platform
 
-# --- [ SCRIPT SETUP ] ---
 try:
     from . import M3GNet, PropertyTrainer, ModelCheckpoint, EarlyStopping, RadiusCutoffGraphConverter
 except ImportError:
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from m3gnet import M3GNet, PropertyTrainer, ModelCheckpoint, EarlyStopping, RadiusCutoffGraphConverter
 
-# ==============================================================================
 # --- [ CONFIGURATION ZONE ] ---
-# All hyperparameters and settings are defined here for easy modification.
-# ==============================================================================
-
-# --- Path Settings ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(SCRIPT_DIR, "data", "cif_file")
 CSV_PATH = os.path.join(DATA_PATH, "id_prop.csv")
 SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "property_predictor")
 
-# --- Model Hyperparameters ---
-# <<<<<<<<<<<<<<<<<<<< NEW CONFIGURATION OPTION HERE <<<<<<<<<<<<<<<<<<<<
-# Choose between 'attention' for context-aware embedding or 'simple' for standard embedding.
-EMBEDDING_TYPE = "simple" 
-
-# --- Training Hyperparameters ---
+EMBEDDING_TYPE = "attention" 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCHS = 50
+EPOCHS = 3
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 USE_EARLY_STOPPING = True
 PATIENCE = 15
-
-# --- Performance Settings ---
 NUM_WORKERS = 0 
 PIN_MEMORY = True if DEVICE == "cuda" else False
 
@@ -58,22 +45,15 @@ def main():
             NUM_WORKERS = num_cores // 2 if num_cores else 0
     
     config = {
-        "Device": DEVICE,
-        "Embedding Type": EMBEDDING_TYPE,
-        "Epochs": EPOCHS,
-        "Batch Size": BATCH_SIZE,
-        "Learning Rate": LEARNING_RATE,
-        "Early Stopping": "Enabled" if USE_EARLY_STOPPING else "Disabled",
-        "Patience": PATIENCE if USE_EARLY_STOPPING else "N/A",
-        "Num Workers": NUM_WORKERS,
-        "Pin Memory": PIN_MEMORY,
-        "Save Directory": os.path.abspath(SAVE_DIR),
+        "Device": DEVICE, "Embedding Type": EMBEDDING_TYPE, "Epochs": EPOCHS, "Batch Size": BATCH_SIZE,
+        "Learning Rate": LEARNING_RATE, "Early Stopping": "Enabled" if USE_EARLY_STOPPING else "Disabled",
+        "Patience": PATIENCE if USE_EARLY_STOPPING else "N/A", "Num Workers": NUM_WORKERS,
+        "Pin Memory": PIN_MEMORY, "Save Directory": os.path.abspath(SAVE_DIR),
         "Data Path": os.path.abspath(DATA_PATH)
     }
     
     print("\n--- M3GNet Training Configuration ---")
-    for key, value in config.items():
-        print(f"{key:<20}: {value}")
+    for key, value in config.items(): print(f"{key:<20}: {value}")
     print("-------------------------------------\n")
     
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -85,27 +65,17 @@ def main():
     targets = df['property'].values
     print(f"Loaded {len(structures)} structures.")
 
-    # --- Initialize Model ---
-    # <<<<<<<<<<<<<<<<<<<< USING THE NEW CONFIGURATION <<<<<<<<<<<<<<<<<<<<
     print(f"Initializing model with '{EMBEDDING_TYPE}' embedding...")
-    model = M3GNet(
-        is_intensive=True, 
-        n_atom_types=95,
-        embedding_type=EMBEDDING_TYPE # Pass the configured type to the model
-    )
+    model = M3GNet(is_intensive=True, n_atom_types=95, embedding_type=EMBEDDING_TYPE)
     model.to(DEVICE)
     converter = model.graph_converter
     
-    # --- Initialize Lazy Layers ---
     print("Initializing lazy layers with a dummy graph...")
     dummy_molecule = Molecule(["O", "H", "H"], [[0, 0, 0], [0, 1, 0], [1, 0, 0]])
     dummy_graph = converter.convert(dummy_molecule)
-    
     from m3gnet.graph.batch import collate_list_of_graphs
     dummy_batch, _ = collate_list_of_graphs([(dummy_graph, torch.tensor(0.0))])
-    
-    with torch.no_grad():
-        model(dummy_batch.to(DEVICE))
+    with torch.no_grad(): model(dummy_batch.to(DEVICE))
     
     print("\n--- Model Architecture (Initialized) ---")
     print(model)
@@ -145,10 +115,18 @@ def main():
     )
 
     print("\n--- Training complete! ---")
-    print(f"Best model saved to: {os.path.join(SAVE_DIR, 'best_model.pt')}")
-    print(f"Last model saved to: {os.path.join(SAVE_DIR, 'last_model.pt')}")
-    print("\nTo evaluate the best model, run:")
-    print(f"python m3gnet/predict.py --model-path {os.path.join(SAVE_DIR, 'best_model.pt')} --input-path {DATA_PATH}")
+    # Define paths to the directories, not files
+    best_model_dir = os.path.join(SAVE_DIR, 'best_model')
+    last_model_dir = os.path.join(SAVE_DIR, 'last_model')
+    print(f"Best model saved to: {best_model_dir}")
+    print(f"Last model saved to: {last_model_dir}")
+    
+    # <<<<<<<<<<<<<<<<<<<< THE FIX IS HERE <<<<<<<<<<<<<<<<<<<<
+    # The command now points to the directory containing the best model
+    print("\nTo evaluate the best model, run the following command from this directory (m3gnet/):")
+    eval_model_dir = os.path.relpath(best_model_dir, SCRIPT_DIR)
+    eval_data_path = os.path.relpath(DATA_PATH, SCRIPT_DIR)
+    print(f"python predict.py {eval_model_dir} {eval_data_path}")
 
 if __name__ == "__main__":
     main()

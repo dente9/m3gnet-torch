@@ -1,4 +1,4 @@
-# m3gnet/run_train.py (Final Fixed Version for direct execution)
+# m3gnet/run_train.py (Final Version compatible with dual-metric Trainer)
 
 import sys
 import os
@@ -12,18 +12,18 @@ from tqdm import tqdm
 import platform
 
 # --- [ 1. ROBUST IMPORT HANDLING ] ---
-# This block ensures that the script can find its sibling modules
-# regardless of where it's run from.
 try:
-    from .models import M3GNet, Potential
-    from .train import PropertyTrainer, PotentialTrainer, ModelCheckpoint, EarlyStopping
-    from .graph import RadiusCutoffGraphConverter
+    from m3gnet.models import M3GNet, Potential
+    from m3gnet.train import PropertyTrainer, PotentialTrainer, ModelCheckpoint, EarlyStopping
+    from m3gnet.graph import RadiusCutoffGraphConverter
+    from m3gnet.graph.batch import collate_list_of_graphs, collate_potential_graphs
 except ImportError:
-    # Add the parent directory of 'm3gnet' to the Python path
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from m3gnet.models import M3GNet, Potential
     from m3gnet.train import PropertyTrainer, PotentialTrainer, ModelCheckpoint, EarlyStopping
     from m3gnet.graph import RadiusCutoffGraphConverter
+    from m3gnet.graph.batch import collate_list_of_graphs, collate_potential_graphs
+
 
 # --- [ 2. CONFIGURATION ZONE ] ---
 # General settings
@@ -36,22 +36,27 @@ NUM_WORKERS = 0
 PIN_MEMORY = True if DEVICE == "cuda" else False
 
 # --- Task-specific settings ---
-TRAINING_TYPE = "property" # Default is property prediction
+# Choose 'property' or 'potential'
+# 'property' is used for predicting total energy (or any other property) from structures only.
+# 'potential' is used for training on energy, forces, and stresses.
+TRAINING_TYPE = "property" 
 
 if TRAINING_TYPE == 'property':
+    # Default settings for property prediction (e.g., total energy)
     DATA_PATH = os.path.join(SCRIPT_DIR, "data", "cif_file")
     CSV_PATH = os.path.join(DATA_PATH, "id_prop.csv")
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "property_predictor")
-    TARGET_COLUMN = 'property'
-    IS_INTENSIVE = False
-    FIT_ELEMENT_REFS = True # Usually False for property prediction
+    TARGET_COLUMN = 'property' # Assumes 'property' column contains total energy
+    IS_INTENSIVE = False     # Total energy is extensive
+    FIT_ELEMENT_REFS = True  # Recommended for total energy
     EMBEDDING_TYPE = "attention"
 
 elif TRAINING_TYPE == 'potential':
+    # Settings for potential training (energy, forces, stresses)
     DATA_PATH = os.path.join(SCRIPT_DIR, "data", "efs_data")
     JSON_PATH = os.path.join(DATA_PATH, "efs.json")
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "potential_predictor")
-    IS_INTENSIVE = False
+    IS_INTENSIVE = False     # Total energy is extensive
     FIT_ELEMENT_REFS = True
     EMBEDDING_TYPE = "attention"
 else:
@@ -61,21 +66,20 @@ else:
 USE_EARLY_STOPPING = True
 PATIENCE = 25
 
-# --- [ 3. HELPER FUNCTION - FIXED ] ---
+
+# --- [ 3. HELPER FUNCTION ] ---
 
 def fit_element_refs(structures: list, energies: np.ndarray, n_atom_types: int) -> np.ndarray:
     """
     Fits elemental reference energies by solving a linear system.
-    This version robustly handles element keys that are strings or Element objects.
     """
     print("Fitting elemental reference energies...")
     feature_matrix = np.zeros((len(structures), n_atom_types))
     for i, s in enumerate(structures):
         for el_key, count in s.composition.get_el_amt_dict().items():
-            # --- ROBUSTNESS FIX IS HERE ---
             if isinstance(el_key, str):
                 el_obj = Element(el_key)
-            else: # It's already an Element object
+            else:
                 el_obj = el_key
             
             if el_obj.Z < n_atom_types:
@@ -104,8 +108,6 @@ def fit_element_refs(structures: list, energies: np.ndarray, n_atom_types: int) 
 
 
 # --- [ 4. MAIN FUNCTION ] ---
-# The main function remains largely the same as the previous correct version.
-# No changes are needed here.
 
 def main():
     """Main training function."""
@@ -134,7 +136,7 @@ def main():
     
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    # Data Loading Logic
+    # --- Data Loading Logic ---
     print("Loading data...")
     if TRAINING_TYPE == 'potential':
         with open(JSON_PATH, 'r') as f:
@@ -152,13 +154,12 @@ def main():
         targets = df[TARGET_COLUMN].values
         print(f"Loaded {len(structures)} structures for property prediction.")
 
-    # Element Refs Fitting and Target Adjustment
+    # --- Element Refs Fitting and Target Adjustment ---
     n_atom_types = 95
     element_refs_data = None
+    original_targets_for_metric = targets.copy() # Backup original targets for metric calculation
+
     if FIT_ELEMENT_REFS:
-        if IS_INTENSIVE:
-            print("Warning: Fitting element refs is enabled but `is_intensive` is True. This is unusual but can be used for offset correction.")
-        
         element_refs_data = fit_element_refs(structures, targets, n_atom_types)
         
         composition_matrix = np.zeros((len(structures), n_atom_types))
@@ -170,10 +171,10 @@ def main():
                     composition_matrix[i, el_obj.Z] = count
         
         ref_energies_per_struct = composition_matrix @ element_refs_data
-        targets = targets - ref_energies_per_struct
+        targets = targets - ref_energies_per_struct # `targets` now becomes interaction energy
         print("\nSubtracted reference/offset energies. The model will now learn the residual.")
 
-    # Model and Trainer Initialization
+    # --- Model and Trainer Initialization ---
     print("\nInitializing model...")
     model = M3GNet(
         is_intensive=IS_INTENSIVE, 
@@ -189,7 +190,6 @@ def main():
     dummy_graph = converter.convert(dummy_molecule)
     
     if TRAINING_TYPE == 'potential':
-        from m3gnet.graph.batch import collate_potential_graphs
         dummy_targets = {'energy': torch.tensor(0.0), 'forces': torch.zeros(3, 3)}
         dummy_batch, _ = collate_potential_graphs([(dummy_graph, dummy_targets)])
         potential = Potential(model)
@@ -197,8 +197,7 @@ def main():
         with torch.no_grad():
             potential(dummy_batch.to(DEVICE), compute_forces=False, compute_stress=False)
     else:
-        from m3gnet.graph.batch import collate_list_of_graphs
-        dummy_batch, _ = collate_list_of_graphs([(dummy_graph, torch.tensor(0.0))])
+        dummy_batch, _ = collate_list_of_graphs([(dummy_graph, torch.tensor(0.0), torch.tensor(0.0))]) # Add dummy original_target
         with torch.no_grad():
             model(dummy_batch.to(DEVICE))
 
@@ -211,13 +210,13 @@ def main():
     print("Pre-processing structures into graphs... (This may take a moment)")
     graphs = [converter.convert(s) for s in tqdm(structures, desc="Converting")]
     
-    # Data Splitting Logic
+    # --- Data Splitting Logic ---
     if TRAINING_TYPE == 'potential':
         indices = list(range(len(graphs)))
         train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42)
         train_graphs = [graphs[i] for i in train_indices]
         val_graphs = [graphs[i] for i in val_indices]
-        train_targets_energy = targets[train_indices]
+        train_targets_energy = targets[train_indices] # These are now interaction energies
         val_targets_energy = targets[val_indices]
         train_targets_forces = [targets_forces[i] for i in train_indices]
         val_targets_forces = [targets_forces[i] for i in val_indices]
@@ -227,8 +226,14 @@ def main():
         else:
             train_targets_stresses, val_targets_stresses = None, None
     else:
-        train_graphs, val_graphs, train_targets, val_targets = train_test_split(
-            graphs, targets, test_size=0.2, random_state=42
+        # Split all necessary data together
+        (
+            train_graphs, val_graphs,
+            train_targets, val_targets,
+            train_original_targets, val_original_targets
+        ) = train_test_split(
+            graphs, targets, original_targets_for_metric,
+            test_size=0.2, random_state=42
         )
 
     print(f"\nTraining set size: {len(train_graphs)}")
@@ -239,18 +244,22 @@ def main():
     steps_per_epoch = len(train_graphs) // BATCH_SIZE
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS * steps_per_epoch if steps_per_epoch > 0 else 1)
 
-    # Select Trainer based on Task
+    # --- Select Trainer and Prepare Arguments ---
     if TRAINING_TYPE == 'potential':
         trainer = PotentialTrainer(potential=Potential(model), optimizer=optimizer, device=DEVICE)
         train_args = {
             "train_graphs": train_graphs, "train_energies": train_targets_energy, "train_forces": train_targets_forces, "train_stresses": train_targets_stresses,
             "val_graphs": val_graphs, "val_energies": val_targets_energy, "val_forces": val_targets_forces, "val_stresses": val_targets_stresses
         }
-    else:
+    else: # property training
         trainer = PropertyTrainer(model=model, optimizer=optimizer, device=DEVICE)
         train_args = {
-            "train_graphs": train_graphs, "train_targets": train_targets,
-            "val_graphs": val_graphs, "val_targets": val_targets
+            "train_graphs": train_graphs, 
+            "train_targets": train_targets, # This is the interaction energy
+            "train_original_targets": train_original_targets, # This is the original total energy
+            "val_graphs": val_graphs, 
+            "val_targets": val_targets,
+            "val_original_targets": val_original_targets
         }
 
     print("\nSetting up callbacks...")

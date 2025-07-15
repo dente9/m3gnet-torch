@@ -39,7 +39,7 @@ PIN_MEMORY = True if DEVICE == "cuda" else False
 TRAINING_TYPE = "property" # Default is property prediction
 
 if TRAINING_TYPE == 'property':
-    DATA_PATH = os.path.join(SCRIPT_DIR, "data", "aaa")
+    DATA_PATH = os.path.join(SCRIPT_DIR, "data", "cif_file")
     CSV_PATH = os.path.join(DATA_PATH, "id_prop.csv")
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "property_predictor")
     TARGET_COLUMN = 'property'

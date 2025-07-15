@@ -15,12 +15,18 @@ python -m m3gnet.graph.tests.test_graph_and_batch
 python -m m3gnet.layers.tests.test_layers
 python -m m3gnet.models.tests.test_models
 python -m m3gnet.train.tests.test_trainer
+```
 
+或者在内部使用
+
+```
+python test.py
 ```
 
 # 训练与评估
 
 ```
 python run_train.py
-python run_evaluate.py --model-dir saved_models/property_predictor --model-type best
+python predict.py saved_models/property_predictor/best_model data/cif_file/
+python predict.py saved_models/property_predictor/best_model data/cif_file/ --no-plot
 ```

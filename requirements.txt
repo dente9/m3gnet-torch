@@ -2,7 +2,9 @@
 #tensorflow==2.10.1
 pymatgen==2022.5.26
 ase==3.22.1
+
+scikit-learn==1.7.0
 #torch  # 2.1.2+cu118
-torch_scatter=2.1.2
-scikit-learn=1.7.0
+torch_scatter==2.1.2
+
 

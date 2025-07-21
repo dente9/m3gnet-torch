@@ -1,33 +1,39 @@
-# m3gnet/layers/_graph_layers.py (Final Version with Selectable Embedding)
+# m3gnet/layers/_graph_layers.py (Final Modified Version)
 
 """Core graph convolutional layers."""
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
-from typing import List
+from typing import List, Optional,Tuple
 
 # Import our new embedding layer
 from ._core import AtomEmbedding, GatedMLP, MLP, AttentionAtomEmbedding
 from ._basis import SphericalBesselWithHarmonics, GaussianBasis, SphericalBesselBasis
 
 class BaseAtomRef(nn.Module):
+    # ... (no change needed)
     def forward(self, graph) -> torch.Tensor:
         batch_size = len(graph.n_atoms)
         return torch.zeros(batch_size, 1, device=graph.atom_features.device)
 
 class AtomRef(nn.Module):
+    # ... (no change needed)
     def __init__(self, property_per_element: torch.Tensor):
         super().__init__()
         self.register_buffer("property_per_element", property_per_element)
     def forward(self, graph) -> torch.Tensor:
-        atom_props = self.property_per_element[graph.atom_features.long().squeeze()]
+        # Use .squeeze() in case atom_features is [N, 1]
+        atom_indices = graph.atom_features.long().squeeze(-1)
+        atom_props = self.property_per_element[atom_indices]
         batch_atom = torch.repeat_interleave(
             torch.arange(len(graph.n_atoms), device=atom_props.device),
             graph.n_atoms.to(atom_props.device)
         )
         return scatter(atom_props, batch_atom, dim=0, reduce="sum").view(-1, 1)
 
+
 class ReduceState(nn.Module):
+    # ... (no change needed)
     def __init__(self, reducer: str = "mean"):
         super().__init__()
         self.reducer = reducer
@@ -35,6 +41,7 @@ class ReduceState(nn.Module):
         return scatter(features, index, dim=0, reduce=self.reducer)
 
 class ConcatAtoms(nn.Module):
+    # ... (no change needed)
     def __init__(self, neurons: List[int]):
         super().__init__()
         self.mlp = GatedMLP(neurons)
@@ -44,7 +51,9 @@ class ConcatAtoms(nn.Module):
         concatenated = torch.cat([sender_atoms, receiver_atoms, bond_features], dim=-1)
         return self.mlp(concatenated)
 
+
 class GatedAtomUpdate(nn.Module):
+    # ... (no change needed)
     def __init__(self, neurons: List[int]):
         super().__init__()
         self.mlp = GatedMLP(neurons)
@@ -57,7 +66,9 @@ class GatedAtomUpdate(nn.Module):
         )
         return atom_features + summed_messages
 
+
 class ThreeDInteraction(nn.Module):
+    # ... (no change needed)
     def __init__(self, update_network: nn.Module, fusion_network: nn.Module):
         super().__init__()
         self.update_network = update_network
@@ -68,6 +79,7 @@ class ThreeDInteraction(nn.Module):
         messages = three_body_basis * third_atom_features
         center_bond_indices = graph.triple_bond_indices[:, 0]
         total_num_bonds = bond_features.size(0)
+        # Use out= argument for in-place scatter to avoid creating new zero tensors on the fly
         summed_messages = scatter(
             messages, center_bond_indices, dim=0, reduce="sum", 
             out=torch.zeros(total_num_bonds, messages.shape[1], device=bond_features.device)
@@ -75,6 +87,7 @@ class ThreeDInteraction(nn.Module):
         return bond_features + self.fusion_network(summed_messages)
 
 class GraphNetworkLayer(nn.Module):
+    # ... (no change needed)
     def __init__(self, atom_network, bond_network, state_network=None):
         super().__init__()
         self.atom_network = atom_network
@@ -89,18 +102,17 @@ class GraphNetworkLayer(nn.Module):
             state_features = self.state_network(atom_features, bond_features, state_features, graph)
         return atom_features, bond_features, state_features
 
+# <<<<<<<<<<<<<<<<< CORE MODIFICATION HERE <<<<<<<<<<<<<<<<<
 class GraphFeaturizer(nn.Module):
     """
-    Handles the initial featurization of the graph, converting atomic numbers
-    and bond lengths into feature vectors.
+    Handles the initial featurization of atoms in the graph, converting atomic
+    numbers into feature vectors. It no longer handles bond features.
     """
     def __init__(
         self, 
         n_atom_types: int, 
         embedding_dim: int, 
-        rbf_type: str = "SphericalBessel", 
         embedding_type: str = "attention", # New parameter to choose embedding type
-        **rbf_kwargs
     ):
         super().__init__()
         
@@ -112,14 +124,14 @@ class GraphFeaturizer(nn.Module):
             self.atom_embedding = AtomEmbedding(n_atom_types, embedding_dim)
             print("Using Standard Atom Embedding.")
 
-        if rbf_type == "Gaussian":
-            gauss_args = {"centers": rbf_kwargs["centers"], "width": rbf_kwargs["width"], "trainable": rbf_kwargs.get("trainable", False)}
-            self.bond_expansion = GaussianBasis(**gauss_args)
-        else:
-            sbb_args = {"max_l": rbf_kwargs["max_l"], "max_n": rbf_kwargs["max_n"], "cutoff": rbf_kwargs["cutoff"]}
-            self.bond_expansion = SphericalBesselBasis(**sbb_args)
+        # The bond_expansion is REMOVED because bond features are now calculated
+        # dynamically inside the main M3GNet model from bond lengths.
+        # self.bond_expansion = ...
     
-    def forward(self, graph):
+    def forward(self, graph: "MaterialGraph") -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Takes a graph and returns initial atom features and state features.
+        """
         if self.embedding_type == "attention":
             # The AttentionAtomEmbedding's forward pass expects the whole graph.
             atom_features = self.atom_embedding(graph)
@@ -127,6 +139,9 @@ class GraphFeaturizer(nn.Module):
             # The standard AtomEmbedding just needs the atom numbers.
             atom_features = self.atom_embedding(graph.atom_features)
             
-        bond_features = self.bond_expansion(graph.bond_features)
+        # We no longer process or return bond features from the featurizer.
+        # The model will generate them dynamically.
+        # bond_features = self.bond_expansion(graph.bond_features) 
         
-        return atom_features, bond_features, graph.state_features
+        # It now returns atom_features and state_features
+        return atom_features, graph.state_features

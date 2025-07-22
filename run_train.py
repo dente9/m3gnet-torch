@@ -1,4 +1,4 @@
-# m3gnet/run_train.py (Final Version compatible with dual-metric Trainer)
+# m3gnet/run_train.py (Final Version with Correct Normalization and Data Handling)
 
 import sys
 import os
@@ -36,28 +36,25 @@ NUM_WORKERS = 0
 PIN_MEMORY = True if DEVICE == "cuda" else False
 
 # --- Task-specific settings ---
-# Choose 'property' or 'potential'
-# 'property' is used for predicting total energy (or any other property) from structures only.
-# 'potential' is used for training on energy, forces, and stresses.
 TRAINING_TYPE = "property" 
 
 if TRAINING_TYPE == 'property':
-    # Default settings for property prediction (e.g., total energy)
     DATA_PATH = os.path.join(SCRIPT_DIR, "data", "cif_file")
     CSV_PATH = os.path.join(DATA_PATH, "id_prop.csv")
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "property_predictor")
-    TARGET_COLUMN = 'property' # Assumes 'property' column contains total energy
-    IS_INTENSIVE = False     # Total energy is extensive
-    FIT_ELEMENT_REFS = True  # Recommended for total energy
+    TARGET_COLUMN = 'property'
+    IS_INTENSIVE = False
+    FIT_ELEMENT_REFS = True
+    USE_NORMALIZATION = True # Switch to turn normalization on/off
     EMBEDDING_TYPE = "attention"
 
 elif TRAINING_TYPE == 'potential':
-    # Settings for potential training (energy, forces, stresses)
     DATA_PATH = os.path.join(SCRIPT_DIR, "data", "efs_data")
     JSON_PATH = os.path.join(DATA_PATH, "efs.json")
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "potential_predictor")
-    IS_INTENSIVE = False     # Total energy is extensive
+    IS_INTENSIVE = False
     FIT_ELEMENT_REFS = True
+    USE_NORMALIZATION = True
     EMBEDDING_TYPE = "attention"
 else:
     raise ValueError(f"Unknown TRAINING_TYPE: {TRAINING_TYPE}")
@@ -68,7 +65,6 @@ PATIENCE = 25
 
 
 # --- [ 3. HELPER FUNCTION ] ---
-
 def fit_element_refs(structures: list, energies: np.ndarray, n_atom_types: int) -> np.ndarray:
     """
     Fits elemental reference energies by solving a linear system.
@@ -77,38 +73,28 @@ def fit_element_refs(structures: list, energies: np.ndarray, n_atom_types: int) 
     feature_matrix = np.zeros((len(structures), n_atom_types))
     for i, s in enumerate(structures):
         for el_key, count in s.composition.get_el_amt_dict().items():
-            if isinstance(el_key, str):
-                el_obj = Element(el_key)
-            else:
-                el_obj = el_key
-            
+            el_obj = Element(el_key)
             if el_obj.Z < n_atom_types:
                 feature_matrix[i, el_obj.Z] = count
-    
-    ata = feature_matrix.T @ feature_matrix
-    atb = feature_matrix.T @ energies
-    
     try:
-        element_refs = np.linalg.solve(ata, atb)
+        element_refs = np.linalg.solve(feature_matrix.T @ feature_matrix, feature_matrix.T @ energies)
         print("Elemental reference energies fitted successfully using np.linalg.solve.")
     except np.linalg.LinAlgError:
         print("Singular matrix encountered. Using pseudo-inverse (pinv) for fitting.")
-        pseudo_inverse = np.linalg.pinv(ata)
-        element_refs = pseudo_inverse @ atb
-
+        element_refs = np.linalg.pinv(feature_matrix) @ energies
+        
     final_refs = np.zeros(n_atom_types)
-    final_refs[:len(element_refs)] = element_refs
+    limit = min(len(element_refs), n_atom_types)
+    final_refs[:limit] = element_refs[:limit]
     
     print("Fitted non-zero elemental references (eV/atom):")
     for i, ref in enumerate(final_refs):
         if abs(ref) > 1e-6:
             print(f"  - {Element.from_Z(i).symbol} (Z={i}): {ref:.4f}")
-            
     return final_refs
 
 
-# --- [ 4. MAIN FUNCTION ] ---
-
+# --- [ 4. MAIN FUNCTION (FINAL CORRECTED VERSION) ] ---
 def main():
     """Main training function."""
     
@@ -125,6 +111,7 @@ def main():
         "Training Type": TRAINING_TYPE, "Device": DEVICE, "Embedding Type": EMBEDDING_TYPE, 
         "Epochs": EPOCHS, "Batch Size": BATCH_SIZE, "Learning Rate": LEARNING_RATE,
         "Is Intensive": IS_INTENSIVE, "Fit Element Refs": FIT_ELEMENT_REFS,
+        "Use Normalization": USE_NORMALIZATION,
         "Early Stopping": "Enabled" if USE_EARLY_STOPPING else "Disabled",
         "Patience": PATIENCE if USE_EARLY_STOPPING else "N/A", "Num Workers": NUM_WORKERS,
         "Pin Memory": PIN_MEMORY, "Save Directory": os.path.abspath(SAVE_DIR)
@@ -139,48 +126,96 @@ def main():
     # --- Data Loading Logic ---
     print("Loading data...")
     if TRAINING_TYPE == 'potential':
-        with open(JSON_PATH, 'r') as f:
-            data_list = json.load(f)
+        with open(JSON_PATH, 'r') as f: data_list = json.load(f)
         structures = [Structure.from_dict(d['structure']) for d in data_list]
-        targets_energy = np.array([d['energy'] for d in data_list])
+        targets_total_energy = np.array([d['energy'] for d in data_list])
         targets_forces = [np.array(d['forces']) for d in data_list]
         targets_stresses = [np.array(d['stress']) for d in data_list] if 'stress' in data_list[0] else None
-        print(f"Loaded {len(structures)} structures with energies, forces, and stresses.")
-        targets = targets_energy
+        print(f"Loaded {len(structures)} structures with EFS data.")
     else: # property training
         df = pd.read_csv(CSV_PATH)
         df['filepath'] = df['filename'].apply(lambda x: os.path.join(DATA_PATH, x))
         structures = [Structure.from_file(f) for f in df['filepath']]
-        targets = df[TARGET_COLUMN].values
+        targets_total_energy = df[TARGET_COLUMN].values
         print(f"Loaded {len(structures)} structures for property prediction.")
 
-    # --- Element Refs Fitting and Target Adjustment ---
+    # --- Data Splitting (must be done before any fitting to prevent data leakage) ---
+    print("\nSplitting data into training and validation sets...")
+    indices = list(range(len(structures)))
+    train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42)
+    
+    train_structures = [structures[i] for i in train_indices]
+    val_structures = [structures[i] for i in val_indices]
+    train_targets_total = targets_total_energy[train_indices]
+    val_targets_total = targets_total_energy[val_indices]
+
+    print(f"Training set size: {len(train_structures)}")
+    print(f"Validation set size: {len(val_structures)}")
+
+    # --- Stats Calculation and Target Transformation (on training set only) ---
     n_atom_types = 95
     element_refs_data = None
-    original_targets_for_metric = targets.copy() # Backup original targets for metric calculation
+    mean_interaction = 0.0
+    std_interaction = 1.0
+    
+    train_original_targets = train_targets_total
+    val_original_targets = val_targets_total
 
-    if FIT_ELEMENT_REFS:
-        element_refs_data = fit_element_refs(structures, targets, n_atom_types)
+    if TRAINING_TYPE == 'property':
+        if FIT_ELEMENT_REFS:
+            element_refs_data = fit_element_refs(train_structures, train_targets_total, n_atom_types)
+            
+            composition_matrix = np.zeros((len(structures), n_atom_types))
+            for i, s in enumerate(structures):
+                for el, count in s.composition.get_el_amt_dict().items():
+                    if Element(el).Z < n_atom_types: composition_matrix[i, Element(el).Z] = count
+            
+            ref_energies_per_struct = composition_matrix @ element_refs_data
+            interaction_energies = targets_total_energy - ref_energies_per_struct
+            
+            if USE_NORMALIZATION:
+                train_interaction_energies = interaction_energies[train_indices]
+                mean_interaction = np.mean(train_interaction_energies)
+                std_interaction = np.std(train_interaction_energies)
+                if std_interaction < 1e-6:
+                    print("Warning: Standard deviation of interaction energy is close to zero. Setting to 1.0.")
+                    std_interaction = 1.0
+                
+                print(f"\nCalculated normalization stats on training set interaction energies:")
+                print(f"  - Mean: {mean_interaction:.4f}")
+                print(f"  - Std Dev: {std_interaction:.4f}")
+                
+                targets_for_training = (interaction_energies - mean_interaction) / std_interaction
+            else: # Use un-normalized interaction energy
+                targets_for_training = interaction_energies
+        else: # Train on total energy directly
+            targets_for_training = targets_total_energy
+
+        train_targets = targets_for_training[train_indices]
+        val_targets = targets_for_training[val_indices]
+    
+    elif TRAINING_TYPE == 'potential':
+        if FIT_ELEMENT_REFS:
+            element_refs_data = fit_element_refs(train_structures, train_targets_total, n_atom_types)
+            train_targets_energy = train_targets_total - np.array([np.sum([element_refs_data[i.specie.Z] for i in s]) for s in train_structures])
+            val_targets_energy = val_targets_total - np.array([np.sum([element_refs_data[i.specie.Z] for i in s]) for s in val_structures])
+        else:
+            train_targets_energy = train_targets_total
+            val_targets_energy = val_targets_total
         
-        composition_matrix = np.zeros((len(structures), n_atom_types))
-        for i, s in enumerate(structures):
-            for el_key, count in s.composition.get_el_amt_dict().items():
-                if isinstance(el_key, str): el_obj = Element(el_key)
-                else: el_obj = el_key
-                if el_obj.Z < n_atom_types:
-                    composition_matrix[i, el_obj.Z] = count
-        
-        ref_energies_per_struct = composition_matrix @ element_refs_data
-        targets = targets - ref_energies_per_struct # `targets` now becomes interaction energy
-        print("\nSubtracted reference/offset energies. The model will now learn the residual.")
+        train_targets_forces = [targets_forces[i] for i in train_indices]
+        val_targets_forces = [targets_forces[i] for i in val_indices]
+        if 'targets_stresses' in locals() and targets_stresses:
+            train_targets_stresses = [targets_stresses[i] for i in train_indices]
+            val_targets_stresses = [targets_stresses[i] for i in val_indices]
+        else:
+            train_targets_stresses, val_targets_stresses = None, None
 
     # --- Model and Trainer Initialization ---
     print("\nInitializing model...")
     model = M3GNet(
-        is_intensive=IS_INTENSIVE, 
-        n_atom_types=n_atom_types, 
-        embedding_type=EMBEDDING_TYPE,
-        element_refs=element_refs_data
+        is_intensive=IS_INTENSIVE, n_atom_types=n_atom_types, embedding_type=EMBEDDING_TYPE,
+        element_refs=element_refs_data, mean=0.0, std=1.0
     )
     model.to(DEVICE)
     converter = model.graph_converter
@@ -197,7 +232,7 @@ def main():
         with torch.no_grad():
             potential(dummy_batch.to(DEVICE), compute_forces=False, compute_stress=False)
     else:
-        dummy_batch, _ = collate_list_of_graphs([(dummy_graph, torch.tensor(0.0), torch.tensor(0.0))]) # Add dummy original_target
+        dummy_batch, _ = collate_list_of_graphs([(dummy_graph, torch.tensor(0.0), torch.tensor(0.0))])
         with torch.no_grad():
             model(dummy_batch.to(DEVICE))
 
@@ -209,36 +244,9 @@ def main():
 
     print("Pre-processing structures into graphs... (This may take a moment)")
     graphs = [converter.convert(s) for s in tqdm(structures, desc="Converting")]
+    train_graphs = [graphs[i] for i in train_indices]
+    val_graphs = [graphs[i] for i in val_indices]
     
-    # --- Data Splitting Logic ---
-    if TRAINING_TYPE == 'potential':
-        indices = list(range(len(graphs)))
-        train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42)
-        train_graphs = [graphs[i] for i in train_indices]
-        val_graphs = [graphs[i] for i in val_indices]
-        train_targets_energy = targets[train_indices] # These are now interaction energies
-        val_targets_energy = targets[val_indices]
-        train_targets_forces = [targets_forces[i] for i in train_indices]
-        val_targets_forces = [targets_forces[i] for i in val_indices]
-        if targets_stresses:
-            train_targets_stresses = [targets_stresses[i] for i in train_indices]
-            val_targets_stresses = [targets_stresses[i] for i in val_indices]
-        else:
-            train_targets_stresses, val_targets_stresses = None, None
-    else:
-        # Split all necessary data together
-        (
-            train_graphs, val_graphs,
-            train_targets, val_targets,
-            train_original_targets, val_original_targets
-        ) = train_test_split(
-            graphs, targets, original_targets_for_metric,
-            test_size=0.2, random_state=42
-        )
-
-    print(f"\nTraining set size: {len(train_graphs)}")
-    print(f"Validation set size: {len(val_graphs)}")
-
     print("\nInitializing optimizer, scheduler, and trainer...")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     steps_per_epoch = len(train_graphs) // BATCH_SIZE
@@ -252,11 +260,14 @@ def main():
             "val_graphs": val_graphs, "val_energies": val_targets_energy, "val_forces": val_targets_forces, "val_stresses": val_targets_stresses
         }
     else: # property training
-        trainer = PropertyTrainer(model=model, optimizer=optimizer, device=DEVICE)
+        trainer = PropertyTrainer(
+            model=model, optimizer=optimizer, device=DEVICE,
+            mean=mean_interaction, std=std_interaction
+        )
         train_args = {
             "train_graphs": train_graphs, 
-            "train_targets": train_targets, # This is the interaction energy
-            "train_original_targets": train_original_targets, # This is the original total energy
+            "train_targets": train_targets,
+            "train_original_targets": train_original_targets,
             "val_graphs": val_graphs, 
             "val_targets": val_targets,
             "val_original_targets": val_original_targets

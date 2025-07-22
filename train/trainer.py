@@ -1,4 +1,4 @@
-# m3gnet/train/trainer.py (Final Version with Dual Metrics)
+# m3gnet/train/trainer.py (Final and Complete Version with Correct Metrics)
 
 from typing import List, Optional, Union, Tuple, Dict
 import logging
@@ -16,40 +16,57 @@ from .callbacks import ModelCheckpoint
 
 logger = logging.getLogger(__name__)
 
-# --- Dataset classes remain unchanged ---
+# --- Dataset classes ---
+# These are helper classes to be used by the trainers.
+
 class M3GNetDataset(Dataset):
+    """
+    A PyTorch Dataset for property prediction. It handles the primary training
+    target (which could be normalized) and an optional original target for metric calculation.
+    """
     def __init__(self, graphs: List[MaterialGraph], targets: np.ndarray, original_targets: Optional[np.ndarray] = None):
         if len(graphs) != len(targets):
             raise ValueError("Number of graphs and targets must be the same.")
         self.graphs = graphs
         self.targets = torch.tensor(targets, dtype=torch.float32)
-        # Store original targets if provided (for total energy MAE)
+        # Store original targets if provided (e.g., for total energy MAE)
         self.original_targets = torch.tensor(original_targets, dtype=torch.float32) if original_targets is not None else self.targets
 
     def __len__(self):
         return len(self.graphs)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Tuple[MaterialGraph, torch.Tensor, torch.Tensor]:
         return self.graphs[idx], self.targets[idx], self.original_targets[idx]
 
 class PotentialDataset(Dataset):
-    # ... (This class remains unchanged, as it already handles multiple targets)
+    """
+    A PyTorch Dataset for potential training (energy, forces, stresses).
+    """
     def __init__(self, graphs: List[MaterialGraph], energies: np.ndarray, forces: List[np.ndarray], stresses: Optional[List[np.ndarray]] = None):
-        if not (len(graphs) == len(energies) == len(forces)): raise ValueError("Mismatch in numbers of graphs, energies, and forces.")
-        if stresses is not None and len(graphs) != len(stresses): raise ValueError("Mismatch in numbers of graphs and stresses.")
+        if not (len(graphs) == len(energies) == len(forces)):
+            raise ValueError("Mismatch in numbers of graphs, energies, and forces.")
+        if stresses is not None and len(graphs) != len(stresses):
+            raise ValueError("Mismatch in numbers of graphs and stresses.")
         self.graphs = graphs
         self.energies = torch.tensor(energies, dtype=torch.float32)
         self.forces = [torch.tensor(f, dtype=torch.float32) for f in forces]
         self.stresses = [torch.tensor(s, dtype=torch.float32) for s in stresses] if stresses is not None else None
-    def __len__(self): return len(self.graphs)
-    def __getitem__(self, idx):
+
+    def __len__(self):
+        return len(self.graphs)
+
+    def __getitem__(self, idx) -> Tuple[MaterialGraph, Dict[str, torch.Tensor]]:
         targets = {"energy": self.energies[idx], "forces": self.forces[idx]}
-        if self.stresses is not None and idx < len(self.stresses): targets["stress"] = self.stresses[idx]
+        if self.stresses is not None and idx < len(self.stresses):
+            targets["stress"] = self.stresses[idx]
         return self.graphs[idx], targets
 
 
 class BaseTrainer:
-    """Base trainer with enhanced logging for multiple metrics."""
+    """
+    Base trainer class providing the core training and validation loops,
+    with enhanced logging for multiple metrics.
+    """
     def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -61,13 +78,11 @@ class BaseTrainer:
 
     def _train_one_epoch(self, loader: DataLoader) -> Dict:
         self.model.train()
-        # Use a dictionary to store running averages of all metrics
         epoch_metrics = {}
         pbar = tqdm(loader, desc="Training", unit="batch")
         
         for batch in pbar:
             self.optimizer.zero_grad()
-            # calc_loss now returns a dictionary of metrics
             batch_metrics = self.calc_loss_and_metrics(batch)
             loss = batch_metrics['loss']
             loss.backward()
@@ -75,7 +90,6 @@ class BaseTrainer:
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            # Update running averages for all returned metrics
             for key, value in batch_metrics.items():
                 if key not in epoch_metrics:
                     epoch_metrics[key] = 0.0
@@ -83,7 +97,6 @@ class BaseTrainer:
             
             pbar.set_postfix({k: f"{v.item():.4f}" for k, v in batch_metrics.items()})
 
-        # Return the average of all metrics over the epoch
         return {k: v / len(loader) for k, v in epoch_metrics.items()}
 
     def _validate_one_epoch(self, loader: DataLoader) -> Dict:
@@ -95,24 +108,31 @@ class BaseTrainer:
             for batch in pbar:
                 batch_metrics = self.calc_loss_and_metrics(batch)
                 
-                # Update running averages for all returned metrics
                 for key, value in batch_metrics.items():
-                    if key not in epoch_metrics:
-                        epoch_metrics[key] = 0.0
-                    epoch_metrics[key] += value.item()
+                    # Prefix validation metrics with "val_"
+                    val_key = f"val_{key}"
+                    if val_key not in epoch_metrics:
+                        epoch_metrics[val_key] = 0.0
+                    epoch_metrics[val_key] += value.item()
                 
                 pbar.set_postfix({f"val_{k}": f"{v.item():.4f}" for k, v in batch_metrics.items()})
                 
-        # Return the average of all metrics over the epoch
-        return {f"val_{k}": v / len(loader) for k, v in epoch_metrics.items()}
+        return {k: v / len(loader) for k, v in epoch_metrics.items()}
 
     def calc_loss_and_metrics(self, batch: Tuple) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
 
 class PropertyTrainer(BaseTrainer):
-    """Trainer for a single property, now with dual metric tracking."""
-    
-    # --- [ MODIFICATION 1: train method now accepts original targets ] ---
+    """
+    Trainer for a single property, with support for target normalization
+    and dual metric tracking (training loss vs. interpretable MAE).
+    """
+    def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device],
+                 mean: float = 0.0, std: float = 1.0):
+        super().__init__(model, optimizer, device)
+        self.mean = torch.tensor(mean, dtype=torch.float32, device=self.device)
+        self.std = torch.tensor(std, dtype=torch.float32, device=self.device)
+
     def train(
         self, train_graphs: List[MaterialGraph], train_targets: np.ndarray,
         val_graphs: Optional[List[MaterialGraph]] = None, val_targets: Optional[np.ndarray] = None,
@@ -138,14 +158,6 @@ class PropertyTrainer(BaseTrainer):
                 collate_fn=collate_list_of_graphs, num_workers=num_workers, pin_memory=pin_memory
             )
         
-        checkpoint_callback = None
-        if callbacks:
-            for cb in callbacks:
-                if isinstance(cb, ModelCheckpoint):
-                    checkpoint_callback = cb
-                    # We optimize based on the main loss, not the secondary metric
-                    checkpoint_callback.monitor = 'val_loss'
-                    
         for epoch in range(epochs):
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
             train_logs = self._train_one_epoch(train_loader)
@@ -155,7 +167,6 @@ class PropertyTrainer(BaseTrainer):
                 val_logs = self._validate_one_epoch(val_loader)
                 logs.update(val_logs)
             
-            # The log summary will now show all metrics
             print(f"Epoch {epoch + 1} Summary: ", " | ".join([f"{k}: {v:.4f}" for k, v in logs.items()]))
             
             if callbacks:
@@ -165,56 +176,52 @@ class PropertyTrainer(BaseTrainer):
                     print("Early stopping triggered. Ending training.")
                     break
         
-        if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
-            best_model_weights_path = os.path.join(checkpoint_callback.best_path, "m3gnet.pt")
-            print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
-            self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
+        if callbacks:
+            for cb in callbacks:
+                if isinstance(cb, ModelCheckpoint) and os.path.exists(cb.best_path):
+                    best_model_weights_path = os.path.join(cb.best_path, "m3gnet.pt")
+                    print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
+                    self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
+                    break
             
-    # --- [ MODIFICATION 2: calc_loss becomes calc_loss_and_metrics ] ---
-    # m3gnet/train/trainer.py -> class PropertyTrainer
-
-    def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """Calculates loss and other metrics for a batch."""
-        # The 'original_targets' are the true total energies. Let's use them.
-        graph, (_, true_total_energies) = batch
-        graph, true_total_energies = graph.to(self.device), true_total_energies.to(self.device)
+    def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]) -> Dict[str, torch.Tensor]:
+        """
+        Calculates loss and a more interpretable MAE metric.
+        """
+        graph, targets_tuple = batch
+        normalized_targets, original_total_targets = targets_tuple[0], targets_tuple[1]
         
-        # 1. Get the model's prediction FOR THE TOTAL ENERGY.
-        #    The model's forward pass already adds element_refs, so this is the final total energy prediction.
-        pred_total_energies = self.model(graph)
-
+        graph = graph.to(self.device)
+        normalized_targets = normalized_targets.to(self.device)
+        original_total_targets = original_total_targets.to(self.device)
+        
+        normalized_preds = self.model(graph)
         metrics = {}
         
         is_intensive = self.model.hparams.get('is_intensive', True)
         if not is_intensive:
-            # This logic is for extensive properties like TOTAL ENERGY.
+            # `loss` is calculated in the normalized space. This is what the model optimizes.
+            metrics['loss'] = self.loss_fn(normalized_preds.squeeze(), normalized_targets.squeeze())
             
-            # Ensure n_atoms is on the correct device and has the right shape
-            n_atoms = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
+            # `total_E_mae` is calculated in the original energy space for interpretability.
+            interaction_preds = normalized_preds * self.std + self.mean
+            element_ref_energies = self.model.element_ref_calc(graph)
+            total_energy_preds = interaction_preds + element_ref_energies
             
-            # 2. Both prediction and target are TOTAL ENERGIES.
-            #    We normalize them by the number of atoms to calculate the primary loss.
-            #    This prevents larger structures from dominating the loss function.
-            normalized_preds = pred_total_energies / n_atoms
-            normalized_targets = true_total_energies.view(-1, 1) / n_atoms
-            
-            # The 'loss' key is what gets optimized. It's the normalized total energy loss.
-            metrics['loss'] = self.loss_fn(normalized_preds, normalized_targets)
-            
-            # 3. As a secondary metric, we calculate the un-normalized Mean Absolute Error (MAE)
-            #    on the total energy. This is often more interpretable (e.g., in eV/atom).
-            #    We can calculate this on a per-atom basis as well for consistency.
-            metrics['total_E_mae_per_atom'] = F.l1_loss(normalized_preds, normalized_targets)
+            # MAE on the final total energy
+            metrics['total_E_mae'] = F.l1_loss(total_energy_preds.squeeze(), original_total_targets.squeeze())
         else:
-            # It's an intensive property. Loss is calculated directly.
-            # Here, the target is the intensive property itself.
-            metrics['loss'] = self.loss_fn(pred_total_energies.squeeze(), true_total_energies.squeeze())
+            # For intensive properties, predictions are compared directly after un-normalizing.
+            unnormalized_preds = normalized_preds * self.std + self.mean
+            metrics['loss'] = self.loss_fn(unnormalized_preds.squeeze(), original_total_targets.squeeze())
+            metrics['mae'] = metrics['loss'].clone().detach()
 
         return metrics
 
-# PotentialTrainer remains unchanged as it already handles multiple loss components
 class PotentialTrainer(BaseTrainer):
-    # ... (no changes needed here, its calc_loss can be adapted to the new multi-metric return format if desired)
+    """
+    Trainer for M3GNet potentials, training on energy, forces, and optionally stresses.
+    """
     def __init__(self, potential: Potential, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         super().__init__(potential.model, optimizer, device)
         self.potential = potential.to(device)
@@ -249,13 +256,6 @@ class PotentialTrainer(BaseTrainer):
                 collate_fn=collate_potential_graphs, num_workers=num_workers, pin_memory=pin_memory
             )
         
-        checkpoint_callback = None
-        if callbacks:
-            for cb in callbacks:
-                if isinstance(cb, ModelCheckpoint):
-                    checkpoint_callback = cb
-                    checkpoint_callback.monitor = 'val_loss' # Ensure it monitors the main loss
-                    
         for epoch in range(epochs):
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
             train_logs = self._train_one_epoch(train_loader)
@@ -275,10 +275,13 @@ class PotentialTrainer(BaseTrainer):
                     print("Early stopping triggered. Ending training.")
                     break
         
-        if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
-            best_model_weights_path = os.path.join(checkpoint_callback.best_path, "m3gnet.pt")
-            print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
-            self.potential.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
+        if callbacks:
+            for cb in callbacks:
+                if isinstance(cb, ModelCheckpoint) and os.path.exists(cb.best_path):
+                    best_model_weights_path = os.path.join(cb.best_path, "m3gnet.pt")
+                    print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
+                    self.potential.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
+                    break
             
     def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         graph, targets = batch
@@ -290,9 +293,8 @@ class PotentialTrainer(BaseTrainer):
         
         pred_energy, pred_forces, pred_stress = self.potential(graph, compute_forces=True, compute_stress=has_stress)
         
-        n_atoms_per_graph = graph.n_atoms.to(self.device).view(-1, 1)
-        n_atoms_per_graph = torch.clamp(n_atoms_per_graph, min=1)
-        e_loss = self.loss_fn(pred_energy / n_atoms_per_graph, target_energy.view(-1, 1) / n_atoms_per_graph)
+        n_atoms_per_graph = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
+        e_loss = self.loss_fn(pred_energy.view(-1, 1) / n_atoms_per_graph, target_energy.view(-1, 1) / n_atoms_per_graph)
         
         f_loss = self.loss_fn(pred_forces, target_forces)
         

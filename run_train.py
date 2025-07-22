@@ -31,8 +31,8 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCHS = 100
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 64
+LEARNING_RATE = 5e-4
 NUM_WORKERS = 0 
 PIN_MEMORY = True if DEVICE == "cuda" else False
 

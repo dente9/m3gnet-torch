@@ -150,38 +150,38 @@ class PropertyTrainer(BaseTrainer):
 
     # <<<<<<<<<<<<<<<<< THE FINAL, CORRECT IMPLEMENTATION <<<<<<<<<<<<<<<<<
     def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]) -> Dict[str, torch.Tensor]:
+        """
+        Calculates a `loss` for optimization and an interpretable `total_E_mae` for evaluation.
+        """
         graph, targets_tuple = batch
-        # This is the NORMALIZED interaction energy
         normalized_interaction_targets, original_total_targets = targets_tuple[0], targets_tuple[1]
         
         graph = graph.to(self.device)
         normalized_interaction_targets = normalized_interaction_targets.to(self.device)
         original_total_targets = original_total_targets.to(self.device)
         
-        # The model's forward pass returns the PREDICTED TOTAL ENERGY
         pred_total_energies = self.model(graph)
         metrics = {}
         
         if not self.model.hparams.get('is_intensive', True):
-            # To get the predicted NORMALIZED interaction energy, we must reverse the model's forward pass logic
             element_ref_energies = self.model.element_ref_calc(graph)
-            # 1. Get predicted interaction energy (un-normalized)
             pred_interaction_energies = pred_total_energies - element_ref_energies
-            # 2. Normalize it using the model's stored mean and std
             pred_normalized_interaction = (pred_interaction_energies - self.model.mean) / self.model.std
 
             n_atoms = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
 
-            # `loss` is calculated on the NORMALIZED, PER-ATOM interaction energy
+            # `loss` is calculated on the NORMALIZED, PER-ATOM interaction energy.
             loss_preds = pred_normalized_interaction / n_atoms
             loss_targets = normalized_interaction_targets.view(-1, 1) / n_atoms
             metrics['loss'] = self.loss_fn(loss_preds, loss_targets)
             
-            # `mae` is calculated on the TOTAL energy, PER-ATOM for interpretability
-            mae_per_structure = torch.abs(pred_total_energies - original_total_targets.view(-1, 1))
-            metrics['mae'] = (mae_per_structure / n_atoms).mean()
-        else:
+            # <<<<<<<<<<<<<<<<< THE FIX IS HERE <<<<<<<<<<<<<<<<<
+            # `total_E_mae` is the Mean Absolute Error on the TOTAL energy, without per-atom normalization.
+            metrics['total_E_mae'] = F.l1_loss(pred_total_energies.squeeze(), original_total_targets.squeeze())
+            
+        else: # Intensive
             metrics['loss'] = self.loss_fn(pred_total_energies.squeeze(), original_total_targets.squeeze())
+            # For intensive properties, MAE is the same as the loss.
             metrics['mae'] = metrics['loss'].clone().detach()
 
         return metrics

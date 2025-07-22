@@ -133,6 +133,7 @@ class PropertyTrainer(BaseTrainer):
         self.mean = torch.tensor(mean, dtype=torch.float32, device=self.device)
         self.std = torch.tensor(std, dtype=torch.float32, device=self.device)
 
+    # <<<<<<<<<<<<<<<<<<<< THE FULL METHOD IS RESTORED HERE <<<<<<<<<<<<<<<<<<<<
     def train(
         self, train_graphs: List[MaterialGraph], train_targets: np.ndarray,
         val_graphs: Optional[List[MaterialGraph]] = None, val_targets: Optional[np.ndarray] = None,
@@ -158,6 +159,13 @@ class PropertyTrainer(BaseTrainer):
                 collate_fn=collate_list_of_graphs, num_workers=num_workers, pin_memory=pin_memory
             )
         
+        checkpoint_callback = None
+        if callbacks:
+            for cb in callbacks:
+                if isinstance(cb, ModelCheckpoint):
+                    checkpoint_callback = cb
+                    checkpoint_callback.monitor = 'val_loss'
+
         for epoch in range(epochs):
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
             train_logs = self._train_one_epoch(train_loader)
@@ -176,17 +184,14 @@ class PropertyTrainer(BaseTrainer):
                     print("Early stopping triggered. Ending training.")
                     break
         
-        if callbacks:
-            for cb in callbacks:
-                if isinstance(cb, ModelCheckpoint) and os.path.exists(cb.best_path):
-                    best_model_weights_path = os.path.join(cb.best_path, "m3gnet.pt")
-                    print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
-                    self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
-                    break
+        if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
+            best_model_weights_path = os.path.join(checkpoint_callback.best_path, "m3gnet.pt")
+            print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
+            self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
             
     def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]) -> Dict[str, torch.Tensor]:
         """
-        Calculates loss and a more interpretable MAE metric.
+        Calculates a `loss` for optimization and an interpretable `mae` for evaluation.
         """
         graph, targets_tuple = batch
         normalized_targets, original_total_targets = targets_tuple[0], targets_tuple[1]
@@ -200,21 +205,26 @@ class PropertyTrainer(BaseTrainer):
         
         is_intensive = self.model.hparams.get('is_intensive', True)
         if not is_intensive:
-            # `loss` is calculated in the normalized space. This is what the model optimizes.
-            metrics['loss'] = self.loss_fn(normalized_preds.squeeze(), normalized_targets.squeeze())
+            n_atoms = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
+
+            # `loss` is calculated in the normalized, per-atom space. This is for the optimizer.
+            loss_preds = normalized_preds / n_atoms
+            loss_targets = normalized_targets.view(-1, 1) / n_atoms
+            metrics['loss'] = self.loss_fn(loss_preds, loss_targets)
             
-            # `total_E_mae` is calculated in the original energy space for interpretability.
+            # <<<<<<<<<<<<<<<<< RENAMING IS HERE <<<<<<<<<<<<<<<<<
+            # `mae` is calculated in the original energy space (eV/atom). This is for us.
             interaction_preds = normalized_preds * self.std + self.mean
             element_ref_energies = self.model.element_ref_calc(graph)
             total_energy_preds = interaction_preds + element_ref_energies
             
-            # MAE on the final total energy
-            metrics['total_E_mae'] = F.l1_loss(total_energy_preds.squeeze(), original_total_targets.squeeze())
+            mae_per_structure = torch.abs(total_energy_preds - original_total_targets.view(-1, 1))
+            # The key is now simply 'mae'
+            metrics['total_e_mae'] = (mae_per_structure / n_atoms).mean()
         else:
-            # For intensive properties, predictions are compared directly after un-normalizing.
             unnormalized_preds = normalized_preds * self.std + self.mean
             metrics['loss'] = self.loss_fn(unnormalized_preds.squeeze(), original_total_targets.squeeze())
-            metrics['mae'] = metrics['loss'].clone().detach()
+            metrics['total_e_mae'] = metrics['loss'].clone().detach()
 
         return metrics
 

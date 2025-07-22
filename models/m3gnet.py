@@ -1,4 +1,4 @@
-# m3gnet/models/m3gnet.py (Final Modified Version after Layer Changes)
+# m3gnet/models/m3gnet.py (Final Version with Internal Normalization)
 
 import json
 import logging
@@ -24,8 +24,8 @@ MODEL_NAME = "m3gnet"
 
 class M3GNet(nn.Module):
     """
-    The main M3GNet model for energy prediction. This class orchestrates the
-    graph conversion, feature extraction, and interaction blocks.
+    The main M3GNet model. Its forward pass now consistently returns the
+    final, un-normalized total energy, handling normalization internally.
     """
     def __init__(
         self, max_n: int = 3, max_l: int = 3, n_blocks: int = 3, units: int = 64,
@@ -40,19 +40,23 @@ class M3GNet(nn.Module):
             "cutoff": cutoff, "threebody_cutoff": threebody_cutoff, "n_atom_types": n_atom_types,
             "is_intensive": is_intensive, "readout": readout, "task_type": task_type,
             "embedding_type": embedding_type, "mean": mean, "std": std, 
-            "element_refs": element_refs, **kwargs
+            "element_refs": element_refs if element_refs is None else element_refs.tolist(), 
+            **kwargs
         }
         
+        # Register mean and std as buffers. They are part of the model's state
+        # but are not trained. They are moved to the correct device with .to(device).
+        self.register_buffer("mean", torch.tensor(mean, dtype=torch.float32))
+        self.register_buffer("std", torch.tensor(std, dtype=torch.float32))
+
         self.graph_converter = RadiusCutoffGraphConverter(cutoff=cutoff, threebody_cutoff=threebody_cutoff)
         
-        # <<<<<<<<<<<<<<<<< UPDATED INITIALIZATION <<<<<<<<<<<<<<<<<
-        # GraphFeaturizer no longer takes RBF arguments
         self.featurizer = GraphFeaturizer(
             n_atom_types=n_atom_types, embedding_dim=units, 
             embedding_type=embedding_type
         )
         
-        self.bond_projection = MLP([1, units]) # Input is bond length (1 dim)
+        self.bond_projection = MLP([1, units])
         self.basis_expansion = SphericalBesselWithHarmonics(max_n=max_n, max_l=max_l, cutoff=cutoff)
         
         shf_dim = (max_l + 1) ** 2
@@ -83,9 +87,7 @@ class M3GNet(nn.Module):
         self.element_ref_calc = AtomRef(property_per_element=torch.tensor(element_refs, dtype=torch.float32)) if element_refs is not None else BaseAtomRef()
 
     def _compute_geometries(self, graph: MaterialGraph) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        A helper method to compute bond and three-body geometries from atom positions.
-        """
+        """A helper method to compute bond and three-body geometries from atom positions."""
         sender_indices = graph.bond_atom_indices[:, 0]
         receiver_indices = graph.bond_atom_indices[:, 1]
         
@@ -126,57 +128,58 @@ class M3GNet(nn.Module):
     def forward(self, graph: MaterialGraph, state_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         The forward pass of the M3GNet model.
+        It returns the final, un-normalized total energy.
         """
-        # Step 1: Dynamically compute bond and angle geometries
         bond_lengths, triple_bond_lengths, cos_theta = self._compute_geometries(graph)
 
-        # <<<<<<<<<<<<<<<<< UPDATED FORWARD PASS <<<<<<<<<<<<<<<<<
-        # Step 2: Featurize atoms. The featurizer now only returns atom and state features.
         atom_features, graph_state_features = self.featurizer(graph)
-        if state_features is None:
-            state_features = graph_state_features
+        if state_features is None: state_features = graph_state_features
 
-        # Project bond lengths into feature space
         bond_features = self.bond_projection(bond_lengths)
         
-        # Step 3: Expand three-body interactions into a basis set
         if graph.has_three_body and triple_bond_lengths is not None and cos_theta is not None:
             three_body_basis = self.basis_expansion(triple_bond_lengths, cos_theta.unsqueeze(-1))
         else:
             three_body_basis = None
             
-        # Step 4: Main interaction loop
         for i in range(self.hparams["n_blocks"]):
             if three_body_basis is not None:
                 bond_features = self.three_interactions[i](atom_features, bond_features, three_body_basis, graph)
             atom_features, bond_features, _ = self.graph_layers[i](atom_features, bond_features, state_features, graph)
         
-        # Step 5: Readout and final MLP
         batch_atom = torch.repeat_interleave(
             torch.arange(len(graph.n_atoms), device=atom_features.device), 
             graph.n_atoms.to(atom_features.device)
         )
         if self.hparams["is_intensive"]:
             readout_vec = self.readout_layer(atom_features, batch_atom)
-            output = self.final_mlp(readout_vec)
-        else:
+            # This is the direct prediction of the intensive property
+            interaction_pred_normalized = self.final_mlp(readout_vec)
+        else: # Extensive
             per_atom_output = self.readout_layer(atom_features)
-            output = self.final_mlp(per_atom_output, batch_atom)
+            # This is the prediction of the extensive property in normalized space
+            interaction_pred_normalized = self.final_mlp(per_atom_output, batch_atom)
         
-        # Step 6: Apply scaling and element reference
-        output = output * self.hparams["std"] + self.hparams["mean"]
-        output += self.element_ref_calc(graph)
+        # --- Un-normalization and final energy calculation ---
+        # 1. Un-normalize the interaction property
+        interaction_pred = interaction_pred_normalized * self.std + self.mean
         
-        return output
+        # 2. Add the elemental reference energy
+        property_offset = self.element_ref_calc(graph)
+        
+        # 3. Return the final total energy
+        return interaction_pred + property_offset
     
     @classmethod
     def load(cls, model_dir: str) -> 'M3GNet':
+        """Loads a model from a directory."""
         if not os.path.isdir(model_dir): raise ValueError(f"'{model_dir}' is not a directory.")
         
         config_path = os.path.join(model_dir, f"{MODEL_NAME}.json")
         if not os.path.exists(config_path): raise FileNotFoundError(f"Config file not found at {config_path}")
         with open(config_path) as f: config = json.load(f)
-        if 'element_refs' in config and config['element_refs'] is not None: config['element_refs'] = np.array(config['element_refs'])
+        if 'element_refs' in config and config['element_refs'] is not None: 
+            config['element_refs'] = np.array(config['element_refs'])
         
         model = cls(**config)
         
@@ -190,14 +193,15 @@ class M3GNet(nn.Module):
         return model
         
     def save(self, dirname: str):
-        # ... (This method should work without changes)
+        """Saves the model to a directory."""
         if not os.path.isdir(dirname): os.makedirs(dirname)
         
-        params_to_save = self.hparams.copy()
-        if 'element_refs' in params_to_save and isinstance(params_to_save['element_refs'], np.ndarray):
-             params_to_save['element_refs'] = params_to_save['element_refs'].tolist()
+        # Update hparams with the final mean and std from the buffers before saving
+        self.hparams['mean'] = self.mean.item()
+        self.hparams['std'] = self.std.item()
+
         with open(os.path.join(dirname, f"{MODEL_NAME}.json"), 'w') as f:
-            json.dump(params_to_save, f, indent=2)
+            json.dump(self.hparams, f, indent=2)
 
         torch.save(self.state_dict(), os.path.join(dirname, f"{MODEL_NAME}.pt"))
 
@@ -205,7 +209,6 @@ class M3GNet(nn.Module):
 class Potential(nn.Module):
     """
     A wrapper class for M3GNet that computes energy, forces, and stress.
-    Forces and stress are calculated via auto-differentiation of energy.
     """
     def __init__(self, model: M3GNet):
         super().__init__()
@@ -230,39 +233,29 @@ class Potential(nn.Module):
             total_energy = self.model(graph)
             energy_sum_for_grad = total_energy.sum()
 
+            forces, stress = None, None
             if compute_forces:
-                # V V V V V FIX IS HERE V V V V V
-                # We need retain_graph=True here to allow the main training loop's 
-                # loss.backward() to function after forces are computed.
                 grads = torch.autograd.grad(
                     outputs=energy_sum_for_grad, 
                     inputs=graph.atom_positions, 
-                    create_graph=True, # Allows for gradient of gradient (e.g., Hessian)
-                    retain_graph=True, # Keeps the graph alive for a second backward pass
+                    create_graph=True,
+                    retain_graph=True,
                 )
                 forces = -grads[0]
-            else:
-                forces = None
             
             if compute_stress and has_lattice:
-                # Since forces already retained the graph, this grad call will work.
-                # If forces are not computed, this call might need retain_graph too.
-                # For safety, we can add it here as well.
                 stress_grads = torch.autograd.grad(
                     outputs=energy_sum_for_grad, 
                     inputs=graph.lattices, 
                     allow_unused=True,
-                    retain_graph=True # Add for safety, in case forces are not computed
+                    retain_graph=True 
                 )
                 if stress_grads[0] is not None:
                     volume = torch.det(graph.lattices).view(-1, 1, 1)
                     stress = stress_grads[0] / volume
                 else: 
                     stress = torch.zeros((len(graph.lattices), 3, 3), device=self.device)
-            else:
-                stress = None
 
-        # Format the output for single vs. multiple graphs
         is_single_graph = graph.n_atoms.size(0) == 1
         if is_single_graph:
             squeezed_energy = total_energy.squeeze(0)

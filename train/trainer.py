@@ -1,4 +1,4 @@
-# m3gnet/train/trainer.py (Final and Complete Version with Correct Metrics)
+# m3gnet/train/trainer.py (Final Version where Model Handles Normalization)
 
 from typing import List, Optional, Union, Tuple, Dict
 import logging
@@ -16,20 +16,18 @@ from .callbacks import ModelCheckpoint
 
 logger = logging.getLogger(__name__)
 
-# --- Dataset classes ---
-# These are helper classes to be used by the trainers.
-
+# --- Dataset classes (No Changes Needed) ---
 class M3GNetDataset(Dataset):
     """
-    A PyTorch Dataset for property prediction. It handles the primary training
-    target (which could be normalized) and an optional original target for metric calculation.
+    A PyTorch Dataset for property prediction.
+    It provides the graph, the primary target (e.g., interaction energy),
+    and the original total energy target for metric calculation.
     """
     def __init__(self, graphs: List[MaterialGraph], targets: np.ndarray, original_targets: Optional[np.ndarray] = None):
         if len(graphs) != len(targets):
             raise ValueError("Number of graphs and targets must be the same.")
         self.graphs = graphs
         self.targets = torch.tensor(targets, dtype=torch.float32)
-        # Store original targets if provided (e.g., for total energy MAE)
         self.original_targets = torch.tensor(original_targets, dtype=torch.float32) if original_targets is not None else self.targets
 
     def __len__(self):
@@ -64,8 +62,7 @@ class PotentialDataset(Dataset):
 
 class BaseTrainer:
     """
-    Base trainer class providing the core training and validation loops,
-    with enhanced logging for multiple metrics.
+    Base trainer class providing the core training and validation loops.
     """
     def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         self.model = model.to(device)
@@ -109,7 +106,6 @@ class BaseTrainer:
                 batch_metrics = self.calc_loss_and_metrics(batch)
                 
                 for key, value in batch_metrics.items():
-                    # Prefix validation metrics with "val_"
                     val_key = f"val_{key}"
                     if val_key not in epoch_metrics:
                         epoch_metrics[val_key] = 0.0
@@ -124,16 +120,14 @@ class BaseTrainer:
 
 class PropertyTrainer(BaseTrainer):
     """
-    Trainer for a single property, with support for target normalization
-    and dual metric tracking (training loss vs. interpretable MAE).
+    Trainer for a single property. The model is expected to handle its own
+    normalization and return final predictions.
     """
-    def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device],
-                 mean: float = 0.0, std: float = 1.0):
+    
+    # <<<<<<<< MODIFICATION 1: __init__ is simplified, no longer needs mean/std <<<<<<<<
+    def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         super().__init__(model, optimizer, device)
-        self.mean = torch.tensor(mean, dtype=torch.float32, device=self.device)
-        self.std = torch.tensor(std, dtype=torch.float32, device=self.device)
 
-    # <<<<<<<<<<<<<<<<<<<< THE FULL METHOD IS RESTORED HERE <<<<<<<<<<<<<<<<<<<<
     def train(
         self, train_graphs: List[MaterialGraph], train_targets: np.ndarray,
         val_graphs: Optional[List[MaterialGraph]] = None, val_targets: Optional[np.ndarray] = None,
@@ -159,13 +153,6 @@ class PropertyTrainer(BaseTrainer):
                 collate_fn=collate_list_of_graphs, num_workers=num_workers, pin_memory=pin_memory
             )
         
-        checkpoint_callback = None
-        if callbacks:
-            for cb in callbacks:
-                if isinstance(cb, ModelCheckpoint):
-                    checkpoint_callback = cb
-                    checkpoint_callback.monitor = 'val_loss'
-
         for epoch in range(epochs):
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
             train_logs = self._train_one_epoch(train_loader)
@@ -184,47 +171,52 @@ class PropertyTrainer(BaseTrainer):
                     print("Early stopping triggered. Ending training.")
                     break
         
-        if checkpoint_callback and os.path.exists(checkpoint_callback.best_path):
-            best_model_weights_path = os.path.join(checkpoint_callback.best_path, "m3gnet.pt")
-            print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
-            self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
+        if callbacks:
+            for cb in callbacks:
+                if isinstance(cb, ModelCheckpoint) and os.path.exists(cb.best_path):
+                    best_model_weights_path = os.path.join(cb.best_path, "m3gnet.pt")
+                    print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
+                    self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
+                    break
             
+    # <<<<<<<< MODIFICATION 2: calc_loss_and_metrics is updated for the new model forward pass <<<<<<<<
     def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]) -> Dict[str, torch.Tensor]:
         """
-        Calculates a `loss` for optimization and an interpretable `mae` for evaluation.
+        Calculates loss on interaction energy and MAE on total energy.
         """
         graph, targets_tuple = batch
-        normalized_targets, original_total_targets = targets_tuple[0], targets_tuple[1]
+        # The primary target is the UN-NORMALIZED interaction energy
+        interaction_targets, original_total_targets = targets_tuple[0], targets_tuple[1]
         
         graph = graph.to(self.device)
-        normalized_targets = normalized_targets.to(self.device)
+        interaction_targets = interaction_targets.to(self.device)
         original_total_targets = original_total_targets.to(self.device)
         
-        normalized_preds = self.model(graph)
+        # The model's forward pass returns the PREDICTED TOTAL ENERGY
+        pred_total_energies = self.model(graph)
         metrics = {}
         
         is_intensive = self.model.hparams.get('is_intensive', True)
         if not is_intensive:
+            # To calculate the loss on interaction energy, we must subtract the
+            # elemental reference energy from the predicted total energy.
+            element_ref_energies = self.model.element_ref_calc(graph)
+            pred_interaction_energies = pred_total_energies - element_ref_energies
+
             n_atoms = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
 
-            # `loss` is calculated in the normalized, per-atom space. This is for the optimizer.
-            loss_preds = normalized_preds / n_atoms
-            loss_targets = normalized_targets.view(-1, 1) / n_atoms
+            # `loss` is calculated on the interaction energy, on a per-atom basis.
+            loss_preds = pred_interaction_energies / n_atoms
+            loss_targets = interaction_targets.view(-1, 1) / n_atoms
             metrics['loss'] = self.loss_fn(loss_preds, loss_targets)
             
-            # <<<<<<<<<<<<<<<<< RENAMING IS HERE <<<<<<<<<<<<<<<<<
-            # `mae` is calculated in the original energy space (eV/atom). This is for us.
-            interaction_preds = normalized_preds * self.std + self.mean
-            element_ref_energies = self.model.element_ref_calc(graph)
-            total_energy_preds = interaction_preds + element_ref_energies
-            
-            mae_per_structure = torch.abs(total_energy_preds - original_total_targets.view(-1, 1))
-            # The key is now simply 'mae'
-            metrics['total_e_mae'] = (mae_per_structure / n_atoms).mean()
+            # `mae` (the interpretable metric) is calculated on the total energy, on a per-atom basis.
+            mae_per_structure = torch.abs(pred_total_energies - original_total_targets.view(-1, 1))
+            metrics['mae'] = (mae_per_structure / n_atoms).mean()
         else:
-            unnormalized_preds = normalized_preds * self.std + self.mean
-            metrics['loss'] = self.loss_fn(unnormalized_preds.squeeze(), original_total_targets.squeeze())
-            metrics['total_e_mae'] = metrics['loss'].clone().detach()
+            # For intensive properties, the prediction is the final value.
+            metrics['loss'] = self.loss_fn(pred_total_energies.squeeze(), original_total_targets.squeeze())
+            metrics['mae'] = metrics['loss'].clone().detach()
 
         return metrics
 
@@ -304,6 +296,7 @@ class PotentialTrainer(BaseTrainer):
         pred_energy, pred_forces, pred_stress = self.potential(graph, compute_forces=True, compute_stress=has_stress)
         
         n_atoms_per_graph = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
+        # Potential trainer loss is also on interaction energy
         e_loss = self.loss_fn(pred_energy.view(-1, 1) / n_atoms_per_graph, target_energy.view(-1, 1) / n_atoms_per_graph)
         
         f_loss = self.loss_fn(pred_forces, target_forces)

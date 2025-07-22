@@ -1,4 +1,4 @@
-# m3gnet/run_train.py (Final Version with Correct Normalization and Data Handling)
+# m3gnet/run_train.py (Final Version with Correct Stats Injection and Training Flow)
 
 import sys
 import os
@@ -45,7 +45,7 @@ if TRAINING_TYPE == 'property':
     TARGET_COLUMN = 'property'
     IS_INTENSIVE = False
     FIT_ELEMENT_REFS = True
-    USE_NORMALIZATION = True # Switch to turn normalization on/off
+    USE_NORMALIZATION = True
     EMBEDDING_TYPE = "attention"
 
 elif TRAINING_TYPE == 'potential':
@@ -54,7 +54,7 @@ elif TRAINING_TYPE == 'potential':
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "potential_predictor")
     IS_INTENSIVE = False
     FIT_ELEMENT_REFS = True
-    USE_NORMALIZATION = True
+    USE_NORMALIZATION = True # Normalization for energy is also recommended here
     EMBEDDING_TYPE = "attention"
 else:
     raise ValueError(f"Unknown TRAINING_TYPE: {TRAINING_TYPE}")
@@ -66,9 +66,7 @@ PATIENCE = 25
 
 # --- [ 3. HELPER FUNCTION ] ---
 def fit_element_refs(structures: list, energies: np.ndarray, n_atom_types: int) -> np.ndarray:
-    """
-    Fits elemental reference energies by solving a linear system.
-    """
+    """Fits elemental reference energies by solving a linear system."""
     print("Fitting elemental reference energies...")
     feature_matrix = np.zeros((len(structures), n_atom_types))
     for i, s in enumerate(structures):
@@ -160,46 +158,45 @@ def main():
     
     train_original_targets = train_targets_total
     val_original_targets = val_targets_total
+    
+    # This logic applies to both property and potential training if FIT_ELEMENT_REFS is on
+    if FIT_ELEMENT_REFS:
+        element_refs_data = fit_element_refs(train_structures, train_targets_total, n_atom_types)
+        
+        composition_matrix = np.zeros((len(structures), n_atom_types))
+        for i, s in enumerate(structures):
+            for el, count in s.composition.get_el_amt_dict().items():
+                if Element(el).Z < n_atom_types: composition_matrix[i, Element(el).Z] = count
+        
+        ref_energies_per_struct = composition_matrix @ element_refs_data
+        interaction_energies = targets_total_energy - ref_energies_per_struct
+        
+        if USE_NORMALIZATION:
+            train_interaction_energies = interaction_energies[train_indices]
+            mean_interaction = np.mean(train_interaction_energies)
+            std_interaction = np.std(train_interaction_energies)
+            if std_interaction < 1e-6:
+                print("Warning: Standard deviation of interaction energy is close to zero. Normalization is skipped.")
+                std_interaction = 1.0
+                mean_interaction = 0.0
+            
+            print(f"\nCalculated normalization stats on training set interaction energies:")
+            print(f"  - Mean: {mean_interaction:.4f}")
+            print(f"  - Std Dev: {std_interaction:.4f}")
 
+    # Set final targets for trainers
     if TRAINING_TYPE == 'property':
         if FIT_ELEMENT_REFS:
-            element_refs_data = fit_element_refs(train_structures, train_targets_total, n_atom_types)
-            
-            composition_matrix = np.zeros((len(structures), n_atom_types))
-            for i, s in enumerate(structures):
-                for el, count in s.composition.get_el_amt_dict().items():
-                    if Element(el).Z < n_atom_types: composition_matrix[i, Element(el).Z] = count
-            
-            ref_energies_per_struct = composition_matrix @ element_refs_data
-            interaction_energies = targets_total_energy - ref_energies_per_struct
-            
-            if USE_NORMALIZATION:
-                train_interaction_energies = interaction_energies[train_indices]
-                mean_interaction = np.mean(train_interaction_energies)
-                std_interaction = np.std(train_interaction_energies)
-                if std_interaction < 1e-6: std_interaction = 1.0
-                
-                print(f"\nCalculated normalization stats on training set interaction energies:")
-                print(f"  - Mean: {mean_interaction:.4f}")
-                print(f"  - Std Dev: {std_interaction:.4f}")
-                
-                targets_for_training = (interaction_energies - mean_interaction) / std_interaction
-            else:
-                targets_for_training = interaction_energies
-        else:
-            targets_for_training = targets_total_energy
-
-        train_targets = targets_for_training[train_indices]
-        val_targets = targets_for_training[val_indices]
+            # Trainer uses un-normalized interaction energies; model handles normalization
+            train_targets = interaction_energies[train_indices]
+            val_targets = interaction_energies[val_indices]
+        else: # Train on total energy directly
+            train_targets = train_targets_total
+            val_targets = val_targets_total
     
     elif TRAINING_TYPE == 'potential':
-        if FIT_ELEMENT_REFS:
-            element_refs_data = fit_element_refs(train_structures, train_targets_total, n_atom_types)
-            train_targets_energy = train_targets_total - np.array([np.sum([element_refs_data[i.specie.Z] for i in s]) for s in train_structures])
-            val_targets_energy = val_targets_total - np.array([np.sum([element_refs_data[i.specie.Z] for i in s]) for s in val_structures])
-        else:
-            train_targets_energy = train_targets_total
-            val_targets_energy = val_targets_total
+        train_targets_energy = interaction_energies[train_indices] if FIT_ELEMENT_REFS else train_targets_total
+        val_targets_energy = interaction_energies[val_indices] if FIT_ELEMENT_REFS else val_targets_total
         
         train_targets_forces = [targets_forces[i] for i in train_indices]
         val_targets_forces = [targets_forces[i] for i in val_indices]
@@ -208,21 +205,39 @@ def main():
             val_targets_stresses = [targets_stresses[i] for i in val_indices]
         else:
             train_targets_stresses, val_targets_stresses = None, None
-
+    
     # --- Model and Trainer Initialization ---
     print("\nInitializing model...")
     model = M3GNet(
         is_intensive=IS_INTENSIVE, n_atom_types=n_atom_types, embedding_type=EMBEDDING_TYPE,
-        element_refs=element_refs_data, mean=0.0, std=1.0 # Start with 0/1
+        element_refs=element_refs_data, 
+        mean=mean_interaction, 
+        std=std_interaction
     )
     model.to(DEVICE)
     converter = model.graph_converter
     
     print("Initializing lazy layers with a dummy graph...")
-    # ... (dummy graph initialization is fine) ...
+    dummy_molecule = Molecule(["O", "H", "H"], [[0, 0, 0], [0, 1, 0], [1, 0, 0]])
+    dummy_graph = converter.convert(dummy_molecule)
+    
+    if TRAINING_TYPE == 'potential':
+        dummy_targets = {'energy': torch.tensor(0.0), 'forces': torch.zeros(3, 3)}
+        dummy_batch, _ = collate_potential_graphs([(dummy_graph, dummy_targets)])
+        potential = Potential(model)
+        potential.to(DEVICE)
+        with torch.no_grad():
+            potential(dummy_batch.to(DEVICE), compute_forces=False, compute_stress=False)
+    else:
+        dummy_batch, _ = collate_list_of_graphs([(dummy_graph, torch.tensor(0.0), torch.tensor(0.0))])
+        with torch.no_grad():
+            model(dummy_batch.to(DEVICE))
 
     print("\n--- Model Architecture (Initialized) ---")
-    # ... (print model and params is fine) ...
+    print(model)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTotal Trainable Parameters: {total_params:,}")
+    print("----------------------------------------\n")
 
     print("Pre-processing structures into graphs...")
     graphs = [converter.convert(s) for s in tqdm(structures, desc="Converting")]
@@ -242,17 +257,16 @@ def main():
             "val_graphs": val_graphs, "val_energies": val_targets_energy, "val_forces": val_targets_forces, "val_stresses": val_targets_stresses
         }
     else: # property training
-        trainer = PropertyTrainer(
-            model=model, optimizer=optimizer, device=DEVICE,
-            mean=mean_interaction, std=std_interaction
-        )
+        trainer = PropertyTrainer(model=model, optimizer=optimizer, device=DEVICE)
         train_args = {
-            "train_graphs": train_graphs, "train_targets": train_targets,
+            "train_graphs": train_graphs, 
+            "train_targets": train_targets, # Pass UN-NORMALIZED interaction energy
             "train_original_targets": train_original_targets,
-            "val_graphs": val_graphs, "val_targets": val_targets,
+            "val_graphs": val_graphs, 
+            "val_targets": val_targets,
             "val_original_targets": val_original_targets
         }
-
+    
     print("\nSetting up callbacks...")
     checkpoint = ModelCheckpoint(save_dir=SAVE_DIR, monitor="val_loss", mode="min")
     callbacks = [checkpoint]
@@ -267,21 +281,9 @@ def main():
         **train_args
     )
 
-    # <<<<<<<<<<<<<<<<< THE FIX IS HERE <<<<<<<<<<<<<<<<<
-    # After training, update the model's internal hparams with the calculated mean and std
-    # before the final save by the checkpoint callback.
-    if USE_NORMALIZATION:
-        print("\nUpdating final best model with normalization stats...")
-        model.hparams["mean"] = mean_interaction
-        model.hparams["std"] = std_interaction
-
     print("\n--- Training complete! ---")
     best_model_dir = os.path.join(SAVE_DIR, 'best_model')
-    # The ModelCheckpoint callback has already loaded the best weights.
-    # Now we save the final model with the updated hparams.
-    model.save(best_model_dir) 
-    print(f"Best model with updated stats saved to: {best_model_dir}")
-
+    print(f"Best model saved to: {best_model_dir}")
 
 if __name__ == "__main__":
     main()

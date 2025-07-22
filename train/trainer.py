@@ -61,70 +61,46 @@ class PotentialDataset(Dataset):
 
 
 class BaseTrainer:
-    """
-    Base trainer class providing the core training and validation loops.
-    """
     def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.device = device
         self.scheduler = None
-
-    def train(self, *args, **kwargs):
-        raise NotImplementedError
-
+    def train(self, *args, **kwargs): raise NotImplementedError
     def _train_one_epoch(self, loader: DataLoader) -> Dict:
         self.model.train()
         epoch_metrics = {}
         pbar = tqdm(loader, desc="Training", unit="batch")
-        
         for batch in pbar:
             self.optimizer.zero_grad()
             batch_metrics = self.calc_loss_and_metrics(batch)
             loss = batch_metrics['loss']
             loss.backward()
             self.optimizer.step()
-            if self.scheduler is not None:
-                self.scheduler.step()
-
+            if self.scheduler is not None: self.scheduler.step()
             for key, value in batch_metrics.items():
-                if key not in epoch_metrics:
-                    epoch_metrics[key] = 0.0
+                if key not in epoch_metrics: epoch_metrics[key] = 0.0
                 epoch_metrics[key] += value.item()
-            
             pbar.set_postfix({k: f"{v.item():.4f}" for k, v in batch_metrics.items()})
-
         return {k: v / len(loader) for k, v in epoch_metrics.items()}
-
     def _validate_one_epoch(self, loader: DataLoader) -> Dict:
         self.model.eval()
         epoch_metrics = {}
         pbar = tqdm(loader, desc="Validation", unit="batch")
-        
         with torch.no_grad():
             for batch in pbar:
                 batch_metrics = self.calc_loss_and_metrics(batch)
-                
                 for key, value in batch_metrics.items():
                     val_key = f"val_{key}"
-                    if val_key not in epoch_metrics:
-                        epoch_metrics[val_key] = 0.0
+                    if val_key not in epoch_metrics: epoch_metrics[val_key] = 0.0
                     epoch_metrics[val_key] += value.item()
-                
                 pbar.set_postfix({f"val_{k}": f"{v.item():.4f}" for k, v in batch_metrics.items()})
-                
         return {k: v / len(loader) for k, v in epoch_metrics.items()}
-
-    def calc_loss_and_metrics(self, batch: Tuple) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
+    def calc_loss_and_metrics(self, batch: Tuple) -> Dict[str, torch.Tensor]: raise NotImplementedError
 
 class PropertyTrainer(BaseTrainer):
-    """
-    Trainer for a single property. The model is expected to handle its own
-    normalization and return final predictions.
-    """
-    
-    # <<<<<<<< MODIFICATION 1: __init__ is simplified, no longer needs mean/std <<<<<<<<
+    # This trainer is now simplified. It expects normalized targets (if applicable)
+    # and relies on the model to handle its internal un-normalization for metrics.
     def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: Union[str, torch.device]):
         super().__init__(model, optimizer, device)
 
@@ -138,13 +114,11 @@ class PropertyTrainer(BaseTrainer):
     ):
         self.scheduler = scheduler
         self.loss_fn = loss_fn
-        
         train_dataset = M3GNetDataset(train_graphs, train_targets, train_original_targets)
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, 
             collate_fn=collate_list_of_graphs, num_workers=num_workers, pin_memory=pin_memory
         )
-        
         val_loader = None
         if val_graphs is not None and val_targets is not None:
             val_dataset = M3GNetDataset(val_graphs, val_targets, val_original_targets)
@@ -152,25 +126,20 @@ class PropertyTrainer(BaseTrainer):
                 val_dataset, batch_size=batch_size, 
                 collate_fn=collate_list_of_graphs, num_workers=num_workers, pin_memory=pin_memory
             )
-        
         for epoch in range(epochs):
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
             train_logs = self._train_one_epoch(train_loader)
             logs = {**train_logs}
-            
             if val_loader:
                 val_logs = self._validate_one_epoch(val_loader)
                 logs.update(val_logs)
-            
             print(f"Epoch {epoch + 1} Summary: ", " | ".join([f"{k}: {v:.4f}" for k, v in logs.items()]))
-            
             if callbacks:
                 for cb in callbacks:
                     cb.on_epoch_end(epoch, logs, model=self.model)
                 if any(getattr(cb, 'stop_training', False) for cb in callbacks):
                     print("Early stopping triggered. Ending training.")
                     break
-        
         if callbacks:
             for cb in callbacks:
                 if isinstance(cb, ModelCheckpoint) and os.path.exists(cb.best_path):
@@ -178,43 +147,40 @@ class PropertyTrainer(BaseTrainer):
                     print(f"\nTraining finished. Loading best model weights from {best_model_weights_path}")
                     self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
                     break
-            
-    # <<<<<<<< MODIFICATION 2: calc_loss_and_metrics is updated for the new model forward pass <<<<<<<<
+
+    # <<<<<<<<<<<<<<<<< THE FINAL, CORRECT IMPLEMENTATION <<<<<<<<<<<<<<<<<
     def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor, ...]]) -> Dict[str, torch.Tensor]:
-        """
-        Calculates loss on interaction energy and MAE on total energy.
-        """
         graph, targets_tuple = batch
-        # The primary target is the UN-NORMALIZED interaction energy
-        interaction_targets, original_total_targets = targets_tuple[0], targets_tuple[1]
+        # This is the NORMALIZED interaction energy
+        normalized_interaction_targets, original_total_targets = targets_tuple[0], targets_tuple[1]
         
         graph = graph.to(self.device)
-        interaction_targets = interaction_targets.to(self.device)
+        normalized_interaction_targets = normalized_interaction_targets.to(self.device)
         original_total_targets = original_total_targets.to(self.device)
         
         # The model's forward pass returns the PREDICTED TOTAL ENERGY
         pred_total_energies = self.model(graph)
         metrics = {}
         
-        is_intensive = self.model.hparams.get('is_intensive', True)
-        if not is_intensive:
-            # To calculate the loss on interaction energy, we must subtract the
-            # elemental reference energy from the predicted total energy.
+        if not self.model.hparams.get('is_intensive', True):
+            # To get the predicted NORMALIZED interaction energy, we must reverse the model's forward pass logic
             element_ref_energies = self.model.element_ref_calc(graph)
+            # 1. Get predicted interaction energy (un-normalized)
             pred_interaction_energies = pred_total_energies - element_ref_energies
+            # 2. Normalize it using the model's stored mean and std
+            pred_normalized_interaction = (pred_interaction_energies - self.model.mean) / self.model.std
 
             n_atoms = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
 
-            # `loss` is calculated on the interaction energy, on a per-atom basis.
-            loss_preds = pred_interaction_energies / n_atoms
-            loss_targets = interaction_targets.view(-1, 1) / n_atoms
+            # `loss` is calculated on the NORMALIZED, PER-ATOM interaction energy
+            loss_preds = pred_normalized_interaction / n_atoms
+            loss_targets = normalized_interaction_targets.view(-1, 1) / n_atoms
             metrics['loss'] = self.loss_fn(loss_preds, loss_targets)
             
-            # `mae` (the interpretable metric) is calculated on the total energy, on a per-atom basis.
+            # `mae` is calculated on the TOTAL energy, PER-ATOM for interpretability
             mae_per_structure = torch.abs(pred_total_energies - original_total_targets.view(-1, 1))
             metrics['mae'] = (mae_per_structure / n_atoms).mean()
         else:
-            # For intensive properties, the prediction is the final value.
             metrics['loss'] = self.loss_fn(pred_total_energies.squeeze(), original_total_targets.squeeze())
             metrics['mae'] = metrics['loss'].clone().detach()
 

@@ -1,4 +1,4 @@
-# m3gnet/run_train.py (Final Version with Correct Stats Injection and Training Flow)
+# m3gnet/run_train.py (Final Version with Correct Normalization and Data Handling)
 
 import sys
 import os
@@ -18,6 +18,7 @@ try:
     from m3gnet.graph import RadiusCutoffGraphConverter
     from m3gnet.graph.batch import collate_list_of_graphs, collate_potential_graphs
 except ImportError:
+    # This allows the script to be run from the root directory (e.g., `python m3gnet/run_train.py`)
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from m3gnet.models import M3GNet, Potential
     from m3gnet.train import PropertyTrainer, PotentialTrainer, ModelCheckpoint, EarlyStopping
@@ -36,19 +37,22 @@ NUM_WORKERS = 0
 PIN_MEMORY = True if DEVICE == "cuda" else False
 
 # --- Task-specific settings ---
+# Choose 'property' or 'potential'
 TRAINING_TYPE = "property" 
 
 if TRAINING_TYPE == 'property':
+    # Settings for property prediction (e.g., total energy)
     DATA_PATH = os.path.join(SCRIPT_DIR, "data", "cif_file")
     CSV_PATH = os.path.join(DATA_PATH, "id_prop.csv")
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "property_predictor")
     TARGET_COLUMN = 'property'
     IS_INTENSIVE = False
     FIT_ELEMENT_REFS = True
-    USE_NORMALIZATION = True
+    USE_NORMALIZATION = True # Switch to turn normalization on/off
     EMBEDDING_TYPE = "attention"
 
 elif TRAINING_TYPE == 'potential':
+    # Settings for potential training (energy, forces, stresses)
     DATA_PATH = os.path.join(SCRIPT_DIR, "data", "efs_data")
     JSON_PATH = os.path.join(DATA_PATH, "efs.json")
     SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models", "potential_predictor")
@@ -183,20 +187,22 @@ def main():
             print(f"\nCalculated normalization stats on training set interaction energies:")
             print(f"  - Mean: {mean_interaction:.4f}")
             print(f"  - Std Dev: {std_interaction:.4f}")
+            
+            # The target for training is the normalized interaction energy
+            targets_for_training = (interaction_energies - mean_interaction) / std_interaction
+        else: # Use un-normalized interaction energy
+            targets_for_training = interaction_energies
+    else: # Train on total energy directly if not fitting refs
+        targets_for_training = targets_total_energy
 
-    # Set final targets for trainers
+    # Set final targets for trainers based on the training type
     if TRAINING_TYPE == 'property':
-        if FIT_ELEMENT_REFS:
-            # Trainer uses un-normalized interaction energies; model handles normalization
-            train_targets = interaction_energies[train_indices]
-            val_targets = interaction_energies[val_indices]
-        else: # Train on total energy directly
-            train_targets = train_targets_total
-            val_targets = val_targets_total
+        train_targets = targets_for_training[train_indices]
+        val_targets = targets_for_training[val_indices]
     
     elif TRAINING_TYPE == 'potential':
-        train_targets_energy = interaction_energies[train_indices] if FIT_ELEMENT_REFS else train_targets_total
-        val_targets_energy = interaction_energies[val_indices] if FIT_ELEMENT_REFS else val_targets_total
+        train_targets_energy = targets_for_training[train_indices]
+        val_targets_energy = targets_for_training[val_indices]
         
         train_targets_forces = [targets_forces[i] for i in train_indices]
         val_targets_forces = [targets_forces[i] for i in val_indices]
@@ -205,7 +211,7 @@ def main():
             val_targets_stresses = [targets_stresses[i] for i in val_indices]
         else:
             train_targets_stresses, val_targets_stresses = None, None
-    
+
     # --- Model and Trainer Initialization ---
     print("\nInitializing model...")
     model = M3GNet(
@@ -260,13 +266,13 @@ def main():
         trainer = PropertyTrainer(model=model, optimizer=optimizer, device=DEVICE)
         train_args = {
             "train_graphs": train_graphs, 
-            "train_targets": train_targets, # Pass UN-NORMALIZED interaction energy
+            "train_targets": train_targets,
             "train_original_targets": train_original_targets,
             "val_graphs": val_graphs, 
             "val_targets": val_targets,
             "val_original_targets": val_original_targets
         }
-    
+
     print("\nSetting up callbacks...")
     checkpoint = ModelCheckpoint(save_dir=SAVE_DIR, monitor="val_loss", mode="min")
     callbacks = [checkpoint]

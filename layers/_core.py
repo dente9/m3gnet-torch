@@ -6,8 +6,7 @@ from typing import List, Optional, Callable
 
 import torch
 import torch.nn as nn
-from torch_scatter import scatter
-
+from torch_scatter import scatter, scatter_softmax
 class MLP(nn.Module):
     """Multi-layer perceptron using LazyLinear for deferred initialization."""
     def __init__(
@@ -65,66 +64,41 @@ class AttentionAtomEmbedding(nn.Module):
     """
     def __init__(self, n_atom_types: int, embedding_dim: int, trainable_base_embedding: bool = True):
         super().__init__()
-        # 1. Base embedding layer (can be frozen or trainable)
         self.base_embedding = nn.Embedding(n_atom_types, embedding_dim)
         self.base_embedding.weight.requires_grad = trainable_base_embedding
 
-        # 2. Linear projections for Query, Key, Value for self-attention
         self.q_proj = nn.Linear(embedding_dim, embedding_dim)
         self.k_proj = nn.Linear(embedding_dim, embedding_dim)
         self.v_proj = nn.Linear(embedding_dim, embedding_dim)
         
-        # 3. Final layer after attention aggregation
         self.final_mlp = MLP([embedding_dim, embedding_dim])
         self.layer_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, graph) -> torch.Tensor:
         """
         The forward pass now requires the whole graph to access neighborhood info.
-        
-        Args:
-            graph (MaterialGraph): The batched material graph.
-            
-        Returns:
-            torch.Tensor: Context-aware atom embeddings of shape [n_atoms, embedding_dim].
         """
-        # Get the context-free base embeddings for all atoms
         base_atom_embeds = self.base_embedding(graph.atom_features.long().squeeze(-1))
         
-        # --- Prepare for attention ---
-        # Each atom acts as a query
         queries = self.q_proj(base_atom_embeds)
-        # Each atom also acts as a key and a value
         keys = self.k_proj(base_atom_embeds)
         values = self.v_proj(base_atom_embeds)
         
-        # --- Gather neighborhood information ---
-        # For each bond, get the sending atom (the neighbor)
         neighbor_indices = graph.bond_atom_indices[:, 0]
-        # And the receiving atom (the center atom)
         center_indices = graph.bond_atom_indices[:, 1]
         
-        # Get the Key and Value vectors for all neighbors
         neighbor_keys = keys[neighbor_indices]
         neighbor_values = values[neighbor_indices]
-        
-        # Get the Query vector for all center atoms that are receiving messages
         center_queries = queries[center_indices]
         
         # --- Scaled Dot-Product Attention ---
-        # energy_ij = (q_i * k_j) / sqrt(d_k)
         attn_scores = torch.sum(center_queries * neighbor_keys, dim=-1) / (self.q_proj.out_features**0.5)
         
-        # Softmax over each atom's neighborhood
-        # `scatter_softmax` is equivalent to grouped softmax
-        # Note: torch_scatter's softmax is not numerically stable for all cases,
-        # we can implement a stable version manually.
-        attn_scores_exp = torch.exp(attn_scores)
-        attn_scores_sum = scatter(attn_scores_exp, center_indices, dim=0, reduce="sum", dim_size=base_atom_embeds.size(0))
-        attn_weights = attn_scores_exp / (attn_scores_sum[center_indices] + 1e-16) # Add epsilon for stability
+        # <<<<<<<<<<<<<<<<< SIMPLIFICATION HERE <<<<<<<<<<<<<<<<<
+        # Use the numerically stable scatter_softmax from torch_scatter
+        attn_weights = scatter_softmax(attn_scores, center_indices, dim=0)
         
         # --- Aggregate Values using Attention Weights ---
-        # message_i = sum(alpha_ij * v_j)
         total_atoms = base_atom_embeds.size(0)
         attn_output = scatter(
             attn_weights.unsqueeze(-1) * neighbor_values, 
@@ -135,8 +109,6 @@ class AttentionAtomEmbedding(nn.Module):
         )
         
         # --- Final Refinement ---
-        # Add & Norm (like in Transformers) and pass through a final MLP
-        # This combines the original embedding with the attention-aggregated context
         refined_embeds = self.layer_norm(base_atom_embeds + attn_output)
         final_embeds = self.final_mlp(refined_embeds)
         

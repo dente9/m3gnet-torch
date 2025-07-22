@@ -46,9 +46,12 @@ class SphericalHarmonicsBasis(nn.Module):
         norm_consts = []
         for l in range(max_l + 1):
             for m in range(l + 1):
+                # Calculate normalization constant for P_l^m
                 val = (2 * l + 1) / (4 * torch.pi) * (math.factorial(l - m) / math.factorial(l + m))
-                norm_consts.append(torch.sqrt(torch.tensor(val)))
-        self.register_buffer("norm_consts", torch.tensor(norm_consts))
+                norm_consts.append(torch.sqrt(torch.tensor(val, dtype=torch.float32)))
+        
+        # Register as a buffer, converting the list of tensors to a single tensor
+        self.register_buffer("norm_consts", torch.stack(norm_consts))
 
     def forward(self, costheta: torch.Tensor, phi: Optional[torch.Tensor] = None) -> torch.Tensor:
         if phi is None:
@@ -91,12 +94,20 @@ class SphericalBesselBasis(nn.Module):
         self.max_l = max_l
         self.max_n = max_n
         self.cutoff = cutoff
-        self.register_buffer("j0_zeros", torch.arange(1, max_n + 1, dtype=torch.float32) * torch.pi)
+        
+        # Pre-calculate zeros and normalization factor and register as buffers
+        j0_zeros = torch.arange(1, max_n + 1, dtype=torch.float32) * torch.pi
+        self.register_buffer("j0_zeros", j0_zeros)
+        
+        norm_factor = torch.sqrt(torch.tensor(2.0 / self.cutoff, dtype=torch.float32))
+        self.register_buffer("norm_factor", norm_factor)
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
         r = r.view(-1, 1)
+        # Use the pre-calculated zeros and normalization factor
         n = self.j0_zeros / self.cutoff
-        return torch.sqrt(torch.tensor(2.0 / self.cutoff)) * torch.sin(n * r) / r
+        # Add a small epsilon to r in the denominator for numerical stability
+        return self.norm_factor * torch.sin(n * r) / (r + 1e-8)
 
 # <<<<<<<<<<<<<<<<<<<< FIX IS HERE <<<<<<<<<<<<<<<<<<<<
 class SphericalBesselWithHarmonics(nn.Module):

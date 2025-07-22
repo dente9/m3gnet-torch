@@ -171,43 +171,44 @@ class PropertyTrainer(BaseTrainer):
             self.model.load_state_dict(torch.load(best_model_weights_path, map_location=self.device))
             
     # --- [ MODIFICATION 2: calc_loss becomes calc_loss_and_metrics ] ---
+    # m3gnet/train/trainer.py -> class PropertyTrainer
+
     def calc_loss_and_metrics(self, batch: Tuple[MaterialGraph, Tuple[torch.Tensor, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Calculates loss and other metrics for a batch."""
-        graph, (targets, original_targets) = batch
-        graph, targets, original_targets = graph.to(self.device), targets.to(self.device), original_targets.to(self.device)
+        # The 'original_targets' are the true total energies. Let's use them.
+        graph, (_, true_total_energies) = batch
+        graph, true_total_energies = graph.to(self.device), true_total_energies.to(self.device)
         
-        # This is the model's prediction of the interaction energy/property
-        interaction_preds = self.model(graph)
+        # 1. Get the model's prediction FOR THE TOTAL ENERGY.
+        #    The model's forward pass already adds element_refs, so this is the final total energy prediction.
+        pred_total_energies = self.model(graph)
 
         metrics = {}
         
-        # Check if the model is for an extensive property
         is_intensive = self.model.hparams.get('is_intensive', True)
         if not is_intensive:
-            # It's an extensive property (like total energy).
-            # The main loss is normalized by the number of atoms.
-            n_atoms = graph.n_atoms.to(self.device).view(-1, 1)
-            n_atoms = torch.clamp(n_atoms, min=1)
+            # This logic is for extensive properties like TOTAL ENERGY.
             
-            normalized_preds = interaction_preds / n_atoms
-            normalized_targets = targets.view(-1, 1) / n_atoms
+            # Ensure n_atoms is on the correct device and has the right shape
+            n_atoms = graph.n_atoms.to(self.device).view(-1, 1).clamp(min=1)
             
-            # The 'loss' key is special: it's what gets optimized
+            # 2. Both prediction and target are TOTAL ENERGIES.
+            #    We normalize them by the number of atoms to calculate the primary loss.
+            #    This prevents larger structures from dominating the loss function.
+            normalized_preds = pred_total_energies / n_atoms
+            normalized_targets = true_total_energies.view(-1, 1) / n_atoms
+            
+            # The 'loss' key is what gets optimized. It's the normalized total energy loss.
             metrics['loss'] = self.loss_fn(normalized_preds, normalized_targets)
             
-            # Now, calculate the secondary metric: Total Energy MAE
-            # Reconstruct total energy prediction by adding back the reference energy
-            # The model's forward pass already does this internally! So interaction_preds is the final total energy prediction.
-            # Correction: The model's forward pass ALREADY adds the element_refs.
-            # So, `interaction_preds` is actually the final total energy prediction.
-            # And `targets` is the interaction energy. We need to add refs back to `targets`.
-            
-            # The model's output `interaction_preds` IS the final total energy prediction.
-            # The `targets` we have are interaction energies. We need original total energies.
-            metrics['total_E_mae'] = F.l1_loss(interaction_preds.squeeze(), original_targets.squeeze())
+            # 3. As a secondary metric, we calculate the un-normalized Mean Absolute Error (MAE)
+            #    on the total energy. This is often more interpretable (e.g., in eV/atom).
+            #    We can calculate this on a per-atom basis as well for consistency.
+            metrics['total_E_mae_per_atom'] = F.l1_loss(normalized_preds, normalized_targets)
         else:
             # It's an intensive property. Loss is calculated directly.
-            metrics['loss'] = self.loss_fn(interaction_preds.view(-1), targets.view(-1))
+            # Here, the target is the intensive property itself.
+            metrics['loss'] = self.loss_fn(pred_total_energies.squeeze(), true_total_energies.squeeze())
 
         return metrics
 

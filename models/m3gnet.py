@@ -171,7 +171,6 @@ class M3GNet(nn.Module):
     
     @classmethod
     def load(cls, model_dir: str) -> 'M3GNet':
-        # ... (This method should work without changes)
         if not os.path.isdir(model_dir): raise ValueError(f"'{model_dir}' is not a directory.")
         
         config_path = os.path.join(model_dir, f"{MODEL_NAME}.json")

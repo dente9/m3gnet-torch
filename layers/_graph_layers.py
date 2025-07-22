@@ -11,13 +11,13 @@ from ._core import AtomEmbedding, GatedMLP, MLP, AttentionAtomEmbedding
 from ._basis import SphericalBesselWithHarmonics, GaussianBasis, SphericalBesselBasis
 
 class BaseAtomRef(nn.Module):
-    # ... (no change needed)
+    
     def forward(self, graph) -> torch.Tensor:
         batch_size = len(graph.n_atoms)
         return torch.zeros(batch_size, 1, device=graph.atom_features.device)
 
 class AtomRef(nn.Module):
-    # ... (no change needed)
+    
     def __init__(self, property_per_element: torch.Tensor):
         super().__init__()
         self.register_buffer("property_per_element", property_per_element)
@@ -33,7 +33,7 @@ class AtomRef(nn.Module):
 
 
 class ReduceState(nn.Module):
-    # ... (no change needed)
+    
     def __init__(self, reducer: str = "mean"):
         super().__init__()
         self.reducer = reducer
@@ -41,7 +41,7 @@ class ReduceState(nn.Module):
         return scatter(features, index, dim=0, reduce=self.reducer)
 
 class ConcatAtoms(nn.Module):
-    # ... (no change needed)
+    
     def __init__(self, neurons: List[int]):
         super().__init__()
         self.mlp = GatedMLP(neurons)
@@ -53,7 +53,7 @@ class ConcatAtoms(nn.Module):
 
 
 class GatedAtomUpdate(nn.Module):
-    # ... (no change needed)
+    
     def __init__(self, neurons: List[int]):
         super().__init__()
         self.mlp = GatedMLP(neurons)
@@ -68,7 +68,7 @@ class GatedAtomUpdate(nn.Module):
 
 
 class ThreeDInteraction(nn.Module):
-    # ... (no change needed)
+    
     def __init__(self, update_network: nn.Module, fusion_network: nn.Module):
         super().__init__()
         self.update_network = update_network
@@ -87,7 +87,7 @@ class ThreeDInteraction(nn.Module):
         return bond_features + self.fusion_network(summed_messages)
 
 class GraphNetworkLayer(nn.Module):
-    # ... (no change needed)
+    
     def __init__(self, atom_network, bond_network, state_network=None):
         super().__init__()
         self.atom_network = atom_network

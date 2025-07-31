@@ -253,7 +253,8 @@ def main():
     print("\nInitializing optimizer, scheduler, and trainer...")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     steps_per_epoch = len(train_graphs) // BATCH_SIZE
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS * steps_per_epoch if steps_per_epoch > 0 else 1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS * steps_per_epoch if steps_per_epoch > 0 else 1,
+                                                            eta_min= LEARNING_RATE * 0.01)
 
     # --- Select Trainer and Prepare Arguments ---
     if TRAINING_TYPE == 'potential':

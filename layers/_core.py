@@ -18,7 +18,7 @@ class MLP(nn.Module):
         super().__init__()
         self.neurons = neurons
         self.activation = activation
-        self.is_output = is_output
+        self.is_output = is_output #when is_output is True, the last layer is linear
 
         self.layers = nn.ModuleList()
         # Use LazyLinear for the first layer to infer input size
@@ -40,8 +40,8 @@ class GatedMLP(nn.Module):
     """Gated multi-layer perceptron."""
     def __init__(self, neurons: List[int], activation: Optional[Callable] = nn.SiLU()):
         super().__init__()
-        self.linear_mlp = MLP(neurons, activation)
-        self.gating_mlp = MLP(neurons, activation, is_output=True)
+        self.linear_mlp = MLP(neurons, activation) #data pipeline,data_output,这里是变换后的特征张量
+        self.gating_mlp = MLP(neurons, activation, is_output=True) #gate pipleline,原始的输出张量
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear_mlp(x) * torch.sigmoid(self.gating_mlp(x))

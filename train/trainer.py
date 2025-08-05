@@ -179,6 +179,10 @@ class PropertyTrainer(BaseTrainer):
             # `total_E_mae` is the Mean Absolute Error on the TOTAL energy, without per-atom normalization.
             metrics['total_E_mae'] = F.l1_loss(pred_total_energies.squeeze(), original_total_targets.squeeze())
             
+            pred_per_atom_e = pred_total_energies.squeeze() / n_atoms.squeeze()
+            target_per_atom_e = original_total_targets.squeeze() / n_atoms.squeeze()
+            metrics['per_atom_E_mae'] = F.l1_loss(pred_per_atom_e, target_per_atom_e)
+            
         else: # Intensive
             metrics['loss'] = self.loss_fn(pred_total_energies.squeeze(), original_total_targets.squeeze())
             # For intensive properties, MAE is the same as the loss.

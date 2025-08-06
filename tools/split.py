@@ -1,5 +1,3 @@
-# prepare_dataset_v4.py
-
 import os
 import re
 import json
@@ -14,10 +12,8 @@ from collections import defaultdict
 # ==============================================================================
 
 # 1. Paths
-# Path to the folder containing ALL .cif files and the main id_prop.csv
-DATA_DIR = "./data_all"
-# Directory where the new train/val/test subdirectories will be created
-OUTPUT_DIR = "./processed_data"
+DATA_DIR = "./data/bbb"
+OUTPUT_DIR = "./data/split_small"
 
 # 2. Splitting Ratios
 TEST_SPLIT_RATIO = 0.05
@@ -25,6 +21,9 @@ VAL_SPLIT_RATIO = 0.05
 
 # 3. Reproducibility
 RANDOM_STATE = 42
+
+# 正则表达式，用于从文件名中提取基础ID (e.g., "mp-12345" from "mp-12345_relaxed.cif")
+BASE_ID_PATTERN = re.compile(r"^(m[pvc]{1,2}-\d+)")
 
 # ==============================================================================
 # ---                       CORE IMPLEMENTATION                          ---
@@ -34,17 +33,19 @@ RANDOM_STATE = 42
 def group_files_by_material(data_dir: str) -> dict:
     """Scans a directory for .cif files and groups them by base material ID."""
     print("Step 1: Grouping CIF files by base material ID...")
-    base_id_pattern = re.compile(r"^(m[pvc]{1,2}-\d+)")
     material_groups = defaultdict(list)
+
+    # 只处理.cif文件
     cif_filenames = [f for f in os.listdir(data_dir) if f.endswith(".cif")]
 
     skipped_count = 0
     for filename in tqdm(cif_filenames, desc="Grouping files"):
-        basename = os.path.splitext(filename)[0]
-        match = base_id_pattern.match(basename)
+        # 从完整文件名中匹配基础ID
+        match = BASE_ID_PATTERN.match(filename)
         if match:
             base_id = match.group(1)
-            material_groups[base_id].append(basename)
+            # 存储不带后缀的文件名
+            material_groups[base_id].append(os.path.splitext(filename)[0])
         else:
             skipped_count += 1
 
@@ -61,13 +62,34 @@ def create_splits(material_groups: dict) -> tuple:
     )
     base_ids = list(material_groups.keys())
 
+    if len(base_ids) == 0:
+        raise ValueError(
+            "No material groups found. Cannot create splits. Check your DATA_DIR."
+        )
+
+    # 确保拆分比例合理
+    if TEST_SPLIT_RATIO + VAL_SPLIT_RATIO >= 1.0:
+        raise ValueError(
+            "Sum of TEST_SPLIT_RATIO and VAL_SPLIT_RATIO must be less than 1.0"
+        )
+
     train_val_ids, test_ids = train_test_split(
         base_ids, test_size=TEST_SPLIT_RATIO, random_state=RANDOM_STATE
     )
-    val_size_adjusted = VAL_SPLIT_RATIO / (1.0 - TEST_SPLIT_RATIO)
-    train_ids, val_ids = train_test_split(
-        train_val_ids, test_size=val_size_adjusted, random_state=RANDOM_STATE
+    # 调整验证集在剩余数据中的比例
+    val_size_adjusted = (
+        VAL_SPLIT_RATIO / (1.0 - TEST_SPLIT_RATIO)
+        if (1.0 - TEST_SPLIT_RATIO) > 0
+        else 0
     )
+
+    if val_size_adjusted > 0 and len(train_val_ids) > 1:
+        train_ids, val_ids = train_test_split(
+            train_val_ids, test_size=val_size_adjusted, random_state=RANDOM_STATE
+        )
+    else:  # 如果剩余数据不够拆分，全部分给训练集
+        train_ids = train_val_ids
+        val_ids = []
 
     train_split = {id: material_groups[id] for id in train_ids}
     val_split = {id: material_groups[id] for id in val_ids}
@@ -84,43 +106,43 @@ def process_and_copy_split(
     split_name: str,
     split_data: dict,
     df_properties: pd.DataFrame,
-    id_col: str,
     src_dir: str,
     dest_dir: str,
 ):
     """
     Processes a single split (train, val, or test):
     1. Creates the destination subdirectory.
-    2. Filters the main DataFrame to create the split's id_prop.csv.
-    3. Copies the corresponding .cif files.
+    2. Filters the main DataFrame using the 'base_id' column.
+    3. Saves the standard, two-column id_prop.csv.
+    4. Copies the corresponding .cif files.
     """
     split_dest_dir = os.path.join(dest_dir, split_name)
     os.makedirs(split_dest_dir, exist_ok=True)
 
-    all_basenames_in_split = {
-        basename
-        for basenames_list in split_data.values()
-        for basename in basenames_list
-    }
+    # 获取当前split中所有的基础ID
+    all_base_ids_in_split = set(split_data.keys())
 
-    # Filter the DataFrame for the current split
+    # <<<<<<<<<<<<<<<<< 核心匹配逻辑 <<<<<<<<<<<<<<<<<
+    # 使用我们之前创建的 'base_id' 列来进行过滤，确保100%正确匹配
     df_split = df_properties[
-        df_properties[id_col].astype(str).isin(all_basenames_in_split)
+        df_properties["base_id"].isin(all_base_ids_in_split)
     ].copy()
 
-    # Save the new id_prop.csv
-    output_csv_path = os.path.join(split_dest_dir, "id_prop.csv")
-    df_split.to_csv(output_csv_path, index=False)
+    # 准备写入标准的CSV，只保留'filename'和'property'两列
+    df_to_save = df_split[["filename", "property"]]
 
-    # <<<<<<<<<<<<<<<<< 新增的文件复制逻辑 <<<<<<<<<<<<<<<<<
+    # 保存为标准的、逗号分隔的CSV文件
+    output_csv_path = os.path.join(split_dest_dir, "id_prop.csv")
+    df_to_save.to_csv(output_csv_path, index=False, sep=",")
+
     print(f"  - Copying {len(df_split)} .cif files for '{split_name}' split...")
-    for basename in tqdm(df_split[id_col], desc=f"Copying {split_name} files"):
-        cif_filename = f"{basename}.cif"
+    # 从过滤后的DataFrame中获取完整文件名列表进行复制
+    for cif_filename in tqdm(df_split["filename"], desc=f"Copying {split_name} files"):
         src_path = os.path.join(src_dir, cif_filename)
         dest_path = os.path.join(split_dest_dir, cif_filename)
 
         if os.path.exists(src_path):
-            shutil.copy2(src_path, dest_path)  # copy2 preserves metadata
+            shutil.copy2(src_path, dest_path)
         else:
             print(f"    - Warning: Source file not found, skipping copy: {src_path}")
     # <<<<<<<<<<<<<<<<< 逻辑结束 <<<<<<<<<<<<<<<<<
@@ -134,24 +156,50 @@ def process_and_copy_split(
 def run_preparation():
     """Main execution function."""
 
-    # --- 1. Load Properties CSV and Identify Columns ---
+    # --- 1. Robustly Load and Parse Properties CSV ---
     prop_csv_path = os.path.join(DATA_DIR, "id_prop.csv")
     if not os.path.exists(prop_csv_path):
         raise FileNotFoundError(f"Error: 'id_prop.csv' not found in {DATA_DIR}")
 
-    print(f"Loading properties from {prop_csv_path}...")
-    df_properties = pd.read_csv(prop_csv_path)
+    print(f"Loading and parsing non-standard properties from {prop_csv_path}...")
 
-    if len(df_properties.columns) < 2:
-        raise ValueError(
-            "id_prop.csv must have at least two columns (ID and property)."
+    try:
+        # 读取整个文件为一列，不识别标题
+        temp_df = pd.read_csv(
+            prop_csv_path, header=None, sep=r"\s{1,}", engine="python"
         )
+        if temp_df.shape[1] == 1:  # 如果还是只有一列（没有空格分隔）
+            temp_df = temp_df[0].str.rsplit("-", n=1, expand=True)
 
-    id_column_name = df_properties.columns[0]
-    property_column_name = df_properties.columns[1]
-    print(
-        f"-> Automatically detected columns: ID='{id_column_name}', Property='{property_column_name}'"
-    )
+        # 提取标题和数据
+        header = (
+            temp_df.iloc[0, 0].replace("property", ""),
+            "property",
+        )  # ('filename', 'property')
+        data = temp_df.iloc[1:]
+
+        # 创建一个干净的DataFrame
+        df_properties = pd.DataFrame(data.values, columns=header)
+        df_properties.rename(
+            columns={df_properties.columns[0]: "filename"}, inplace=True
+        )
+        df_properties["property"] = pd.to_numeric(df_properties["property"])
+        df_properties.dropna(inplace=True)
+
+        print(f"-> Successfully parsed {len(df_properties)} records.")
+
+        # <<<<<<<<<<<<<<<<< 关键新增步骤: 创建 'base_id' 列用于匹配 <<<<<<<<<<<<<<<<<
+        def extract_base_id(filename):
+            match = BASE_ID_PATTERN.match(str(filename))
+            return match.group(1) if match else None
+
+        df_properties["base_id"] = df_properties["filename"].apply(extract_base_id)
+        # 丢掉那些无法提取base_id的行
+        df_properties.dropna(subset=["base_id"], inplace=True)
+        print(f"-> Extracted base_id for {len(df_properties)} records for matching.")
+
+    except Exception as e:
+        raise ValueError(f"Failed to parse CSV file: {e}")
 
     # --- 2. Group, Split, and Process Files ---
     material_groups = group_files_by_material(DATA_DIR)
@@ -160,13 +208,13 @@ def run_preparation():
     print("\nStep 3: Processing splits (creating CSVs and copying CIFs)...")
 
     train_info = process_and_copy_split(
-        "train", train_split, df_properties, id_column_name, DATA_DIR, OUTPUT_DIR
+        "train", train_split, df_properties, DATA_DIR, OUTPUT_DIR
     )
     val_info = process_and_copy_split(
-        "val", val_split, df_properties, id_column_name, DATA_DIR, OUTPUT_DIR
+        "val", val_split, df_properties, DATA_DIR, OUTPUT_DIR
     )
     test_info = process_and_copy_split(
-        "test", test_split, df_properties, id_column_name, DATA_DIR, OUTPUT_DIR
+        "test", test_split, df_properties, DATA_DIR, OUTPUT_DIR
     )
 
     # --- 4. Save Final Summary ---
@@ -174,7 +222,7 @@ def run_preparation():
         "source_directory": os.path.abspath(DATA_DIR),
         "output_directory": os.path.abspath(OUTPUT_DIR),
         "split_ratios": {
-            "train": 1 - TEST_SPLIT_RATIO - VAL_SPLIT_RATIO,
+            "train": 1.0 - TEST_SPLIT_RATIO - VAL_SPLIT_RATIO,
             "validation": VAL_SPLIT_RATIO,
             "test": TEST_SPLIT_RATIO,
         },
